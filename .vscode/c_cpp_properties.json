@@ -1,0 +1,23 @@
+{
+    "configurations": [
+        {
+            "name": "c/cpp plugin configurations",
+            "compilerPath": "d:\\HiSpark Studio\\HiSpark Studio\\tools\\Windows\\linx-llvm-binary-release-win-musl\\bin\\clang.exe",
+            "includePath": [
+                "d:\\HiSpark Studio\\tools\\Windows\\linx-llvm-binary-release-win-musl\\riscv32-elf\\lib-lld\\include",
+                "${workspaceFolder}/**"
+            ],
+            "browse": {
+                "limitSymbolsToIncludedHeaders": true,
+                "path": [
+                    "${workspaceFolder}/**"
+                ]
+            },
+            "intelliSenseMode": "linux-clang-arm",
+            "defines": [
+                "FLOAT_SUPPORT"
+            ]
+        }
+    ],
+    "version": 4
+}

@@ -1,0 +1,74 @@
+{
+    "system": [
+        {
+            "name": "compile",
+            "subsystem": [
+                {
+                    "name": "static_lib",
+                    "component": [
+                        {
+                            "name": "",
+                            "target_type": "static",
+                            "sources": [],
+                            "includes": [],
+                            "define": [],
+                            "libs": [],
+                            "lds_scripts": [],
+                            "cflags": [],
+                            "asmflags": [],
+                            "ldflags": []
+                        }
+                    ]
+                },
+                {
+                    "name": "compile_frame",
+                    "cflags": [
+                        "-mcpu=cortex-m7",
+                        "-mthumb",
+                        "-mfloat-abi=softfp",
+                        "-mfpu=fpv4-sp-d16",
+                        "-Os",
+                        "-ffunction-sections",
+                        "-fdata-sections",
+                        "-fno-common",
+                        "-fomit-frame-pointer",
+                        "-fno-strict-aliasing",
+                        "-fno-dwarf2-cfi-asm",
+                        "-fstack-protector-strong",
+                        "-Wframe-larger-than=3072",
+                        "-Wall",
+                        "-std=gnu11",
+                        "-MMD",
+                        "-MP"
+                    ],
+                    "asmflags": [],
+                    "ldflags": [
+                        "-mcpu=cortex-m7",
+                        "-mthumb",
+                        "-mfloat-abi=softfp",
+                        "-mfpu=fpv4-sp-d16",
+                        "-Os",
+                        "-ffunction-sections",
+                        "-fdata-sections",
+                        "-fno-common",
+                        "-fomit-frame-pointer",
+                        "-fno-strict-aliasing",
+                        "-fno-dwarf2-cfi-asm",
+                        "-Wall",
+                        "-Xlinker",
+                        "--gc-sections",
+                        "-Wl,-Map,bin/target.map",
+                        "--specs=nano.specs",
+                        "-lc_nano",
+                        "-lm",
+                        "-lnosys"
+                    ],
+                    "define": [
+                        "CHIP_3071"
+                    ],
+                    "nocheck": []
+                }
+            ]
+        }
+    ]
+}

@@ -1,0 +1,61 @@
+{
+    "configurations": [
+        {
+            "type": "hispark-device-tool-debug",
+            "request": "launch",
+            "name": "GDB Launch (Download and Reset Program)",
+            "debugInitPath": "${workspaceFolder}/.vscode",
+            "servertype": "openocd(HiSpark-Trace)",
+            "executable": "./out/bin/target.elf",
+            "toolchainBinDir": "${command:toolsPath}\\Windows\\linx-llvm-binary-release-win-musl\\bin\\riscv32",
+            "internalConsoleOptions": "openOnSessionStart",
+            "serverpath": "${command:toolsPath}\\hw_openocd\\bin\\openocd.exe",
+            "serverArgs": [
+                "-c",
+                "adapter speed 5000",
+                "-c",
+                "gdb_port 3333",
+                "-s",
+                "${command:toolsPath}\\hw_openocd",
+                "-f",
+                "interface\\cmsis-dap.cfg",
+                "-f",
+                "target\\3066HAPIMM0-swd.cfg",
+                "-p",
+                "d:\\HiSpark Studio\\HiSpark Studio\\tools\\hw_openocd\\target\\3066HAPIMM0.txt"
+            ],
+            "loadFiles": [
+                "./out/bin/target.bin",
+                "${command:toolsPath}\\hw_openocd\\bin\\burn_flash_algo\\online_burn\\CHIP_3066H\\PART_MAIN_RGN\\FlashAlgo.elf",
+                "0x3000000"
+            ],
+            "svdFile": "${command:projectWizardExtensionPath}\\resources\\debug\\svd\\3066HAPIMM.svd"
+        },
+        {
+            "type": "hispark-device-tool-debug",
+            "request": "attach",
+            "name": "GDB Attach (Attach to Running Program)",
+            "debugInitPath": "${workspaceFolder}/.vscode",
+            "servertype": "openocd(HiSpark-Trace)",
+            "executable": "./out/bin/target.elf",
+            "toolchainBinDir": "${command:toolsPath}\\Windows\\linx-llvm-binary-release-win-musl\\bin\\riscv32",
+            "internalConsoleOptions": "openOnSessionStart",
+            "serverpath": "${command:toolsPath}\\hw_openocd\\bin\\openocd.exe",
+            "serverArgs": [
+                "-c",
+                "adapter speed 5000",
+                "-c",
+                "gdb_port 3333",
+                "-s",
+                "${command:toolsPath}\\hw_openocd",
+                "-f",
+                "interface\\cmsis-dap.cfg",
+                "-f",
+                "target\\3066HAPIMM0-swd.cfg",
+                "-p",
+                "d:\\HiSpark Studio\\HiSpark Studio\\tools\\hw_openocd\\target\\3066HAPIMM0.txt"
+            ],
+            "svdFile": "${command:projectWizardExtensionPath}\\resources\\debug\\svd\\3066HAPIMM.svd"
+        }
+    ]
+}

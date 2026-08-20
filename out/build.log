@@ -1,0 +1,104 @@
+Done. Made 1 targets from 4 files in 6ms
+ninja: Entering directory `out'
+[1/88] cross compiler obj/chip/3066h/startup.o
+[2/88] cross compiler obj/chip/3066h/chipinit/chipinit.o
+[3/88] cross compiler obj/chip/3066h/chipinit/anatrim/anatrim.o
+[4/88] cross compiler obj/chip/3066h/chipinit/anavrefinit/anavrefinit.o
+[5/88] cross compiler obj/chip/3066h/chipinit/crginit/crginit.o
+[6/88] cross compiler obj/chip/3066h/chipinit/flashinit/flashinit.o
+[7/88] cross compiler obj/chip/3066h/chipinit/nosinit/nosinit.o
+[8/88] cross compiler obj/chip/3066h/chipinit/pmpinit/pmpinit.o
+[9/88] cross compiler obj/chip/3066h/chipinit/systickinit/systickinit.o
+[10/88] cross compiler obj/chip/3066h/fotp/fotp_info_read.o
+[11/88] cross compiler obj/chip/3066h/ip_crg/ip_crg_common.o
+[12/88] cross compiler obj/chip/3066h/pmp/pmp.o
+[13/88] cross compiler obj/chip/3066h/systick/systick.o
+[14/88] cross compiler obj/drivers/acmp/src/acmp.o
+[15/88] cross compiler obj/drivers/acmp/src/acmp_ex.o
+[16/88] cross compiler obj/drivers/adc/src/adc.o
+[17/88] cross compiler obj/drivers/adc/src/adc_ex.o
+[18/88] cross compiler obj/drivers/base/src/assert.o
+[19/88] cross compiler obj/drivers/base/src/base_math.o
+[20/88] cross compiler obj/drivers/base/src/clock.o
+[21/88] cross compiler obj/drivers/base/src/generalfunc.o
+[22/88] cross compiler obj/drivers/base/src/interrupt.o
+[23/88] cross compiler obj/drivers/base/src/lock.o
+[24/88] cross compiler obj/drivers/base/src/reset.o
+[25/88] cross compiler obj/drivers/can/src/can_ex.o
+[26/88] cross compiler obj/drivers/capm/src/capm.o
+[27/88] cross compiler obj/drivers/cfd/src/cfd.o
+[28/88] cross compiler obj/drivers/cmm/src/cmm.o
+[29/88] cross compiler obj/drivers/crc/src/crc.o
+[30/88] cross compiler obj/drivers/dac/src/dac.o
+[31/88] cross compiler obj/drivers/dac/src/dac_ex.o
+[32/88] cross compiler obj/drivers/apt/src/apt.o
+[33/88] cross compiler obj/drivers/debug/log/src/cmd.o
+[34/88] cross compiler obj/drivers/apt/src/apt_ex.o
+[35/88] cross compiler obj/drivers/debug/log/src/cmd_common.o
+[36/88] cross compiler obj/drivers/debug/log/src/console.o
+[37/88] cross compiler obj/drivers/can/src/can.o
+[38/88] cross compiler obj/drivers/crg/src/crg.o
+[39/88] cross compiler obj/drivers/debug/log/src/app_command.o
+[40/88] cross compiler obj/drivers/debug/log/src/dfx_debug.o
+[41/88] cross compiler obj/drivers/debug/log/src/config.o
+[42/88] cross compiler obj/drivers/debug/log/src/event.o
+[43/88] cross compiler obj/drivers/dma/src/dma_ex.o
+[44/88] cross compiler obj/drivers/dma/src/dma.o
+[45/88] cross compiler obj/drivers/debug/src/debug.o
+[46/88] cross compiler obj/drivers/debug/log/src/dfx_log_proc.o
+[47/88] cross compiler obj/drivers/debug/log/src/ext_command.o
+[48/88] cross compiler obj/drivers/debug/log/src/dfx_log.o
+[49/88] cross compiler obj/drivers/gpio/src/gpio_ex.o
+[50/88] cross compiler obj/drivers/flash/src/flash.o
+[51/88] cross compiler obj/drivers/gpio/src/gpio.o
+[52/88] cross compiler obj/drivers/fmc/src/fmc.o
+[53/88] cross compiler obj/drivers/gpt/src/gpt_ex.o
+[54/88] cross compiler obj/drivers/iwdg/src/iwdg_ex.o
+[55/88] cross compiler obj/drivers/gpt/src/gpt.o
+[56/88] cross compiler obj/drivers/mau/src/mau.o
+[57/88] cross compiler obj/drivers/i2c/src/i2c_ex.o
+[58/88] cross compiler obj/drivers/pga/src/pga.o
+[59/88] cross compiler obj/drivers/iocmg/src/iocmg.o
+[60/88] cross compiler obj/drivers/iocmg/src/iocmg_ex.o
+[61/88] cross compiler obj/drivers/pmc/src/pmc.o
+[62/88] cross compiler obj/drivers/qdm/src/qdm.o
+[63/88] cross compiler obj/drivers/iwdg/src/iwdg.o
+[64/88] cross compiler obj/drivers/smbus/src/smbus_ex.o
+[65/88] cross compiler obj/drivers/ipcm/src/ipcm.o
+[66/88] cross compiler obj/drivers/i2c/src/i2c.o
+[67/88] cross compiler obj/drivers/spi/src/spi.o
+[68/88] cross compiler obj/drivers/spi/src/spi_ex.o
+[69/88] cross compiler obj/drivers/srm/src/srm.o
+[70/88] cross compiler obj/drivers/timer/src/timer.o
+[71/88] cross compiler obj/drivers/timer/src/timer_ex.o
+[72/88] cross compiler obj/drivers/tsensor/src/tsensor.o
+[73/88] cross compiler obj/drivers/uart/src/uart.o
+[74/88] cross compiler obj/drivers/uart/src/uart_ex.o
+[75/88] cross compiler obj/drivers/wwdg/src/wwdg.o
+[76/88] cross compiler obj/drivers/wwdg/src/wwdg_ex.o
+[77/88] cross compiler obj/middleware/coprocessor/cpm.o
+[78/88] cross compiler obj/drivers/smbus/src/smbus.o
+[79/88] cross compiler obj/middleware/mailbox/mailbox.o
+[80/88] cross compiler obj/user/pid/pid.o
+[81/88] cross compiler obj/user/motors/motor_bldc.o
+../user/motors/motor_bldc.c:223:11: warning: unused variable 'piOut' [-Wunused-variable]
+    float piOut = PIDCtrl_Exec(&s->pid, err, 0, ts);   /* 速度误差积分 + 限幅 */
+          ^
+../user/motors/motor_bldc.c:249:54: warning: unused parameter 'fgActive' [-Wunused-parameter]
+float BldcPos_Exec(Motor_Bldc *m, float curDeg, bool fgActive, bool running, uint8_t *dir)
+                                                     ^
+../user/motors/motor_bldc.c:249:69: warning: unused parameter 'running' [-Wunused-parameter]
+float BldcPos_Exec(Motor_Bldc *m, float curDeg, bool fgActive, bool running, uint8_t *dir)
+
+3 warnings generated.
+                                                                    ^
+
+
+[82/88] cross compiler obj/user/adc/adc_user.o
+
+[83/88] cross compiler obj/user/main.o
+[84/88] cross compiler obj/user/motors/motor_stepper.o
+[85/88] cross compiler obj/user/generatecode/system_init.o
+[86/88] cross compiler obj/user/uart/uart_bus.o
+[87/88] cross compiler obj/user/uart/uart_ring.o
+[88/88] LINK ./bin/target.elf
