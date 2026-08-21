@@ -29,7 +29,7 @@
 #include "crg.h"
 
 #ifndef CFG_NOS_MAINTASK_STACKSIZE
-#define CFG_NOS_MAINTASK_STACKSIZE 0x500
+#define CFG_NOS_MAINTASK_STACKSIZE 0x1000
 #endif
 #define CYCCLE_PERUS 200
 // User define the stack size of main task by CFG_NOS_MAINTASK_STACKSIZE

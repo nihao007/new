@@ -1,18 +1,19 @@
 /**
  * 3 板共线总线关节伺服 —— 控制核心参考 user(PID完成2) 级联 PID 实现
  * 控制律 (简单级联, 无状态机):
- *   位置环 40ms: ADC 三点标定 → 动态积分限幅 (lim=|pe|*100+500) → BldcPos_Exec 算速度目标
+ *   位置环 20ms: ADC 三点标定 → 动态积分限幅 (lim=|pe|*100+500) → BldcPos_Exec 算速度目标
  *   速度环 5ms:  BldcSpd_Run (cmdRpm 斜坡 + actRpm 斜坡 + 速度 PI) → duty/FR
- *   新目标: Bldc_SetTargetDeg 预置积分 holdIntegral + 放宽积分限幅, 位置环 40ms 后收窄
+ *   新目标: Bldc_SetTargetDeg 预置积分 holdIntegral + 放宽积分限幅, 位置环 20ms 后收窄
  *   死区保持: |pe|<2° → 小 P (holdKp) 微速, |cmdRpm|<1 → duty=积分 (保持力)
- * 总线 (UART1, 115200, 多板共线, 跳线 GPIO2_7/GPIO3_0 识别本板):
+ * 总线 (UART1, 115200, 多板共线, 跳线 GPIO3_1/GPIO3_0 识别本板):
  *   帧: [AA][ID][CMD][目标/填充][SUM]  SUM=除校验字节外累加 & 0xFF (统一 5B, 无父角)
  *   ID=电机号 01~04, 跳线决定本板响应哪些: 00→04(无刷单板) / 01→02+03(双无刷) / 10→01(步进)
  *   读: [AA][ID][01][X][SUM] → 回 [AA][ID][世界角][SUM] (X 忽略)
- *   写: [AA][ID][00][目标][SUM] → 执行, 不应答 (目标: M2/M3 世界角, M1/M4 局部)
+ *   写: [AA][ID][00][目标][SUM] → 无刷目标角/步进方向0相对角度, 不应答
+ *       [AA][01][03][角度][SUM] → 步进方向1相对角度, 不应答
  *   急停: [AA][ID][02][X][SUM] (ID 任意) → 本板所有电机停止, 不应答
  *   M3 世界角 = M2 ADC 实测 + M3 局部 − 90 (世界角闭环, 位置环每拍用 M2)
- * 遥测: DIAG_EN=1 时每 500ms 打印本板电机 cur/tgt/duty/cmd/rpm/en
+ * 遥测: DIAG_EN=1 时每 200ms 打印本板电机 cur/tgt/duty/cmd/rpm/en
  */
 
 #include "typedefs.h"
@@ -27,6 +28,26 @@
 #include "uart/uart_bus.h"
 #include "motors/motor_bldc.h"
 #include "motors/motor_stepper.h"
+
+/* TIMER1与当前CPU均为200MHz；阶段一统一用硬件计数器做微秒级统计。 */
+#define CONTROL_TICKS_PER_US 200U
+#define SPEED_LOOP_PERIOD_US 5000U
+#define SPEED_LOOP_PERIOD_TICKS (SPEED_LOOP_PERIOD_US * CONTROL_TICKS_PER_US)
+#define POSITION_LOOP_DIV 4U
+#define TELEMETRY_LOOP_DIV 40U
+#define STALL_DETECT_POSITION_CYCLES 50U
+#define STALL_RECOVERY_US 50000U
+
+#ifdef NOS_TASK_SUPPORT
+#include "nos_task.h"
+#endif
+
+#ifdef NOS_TASK_SUPPORT
+#define CONTROL_TASK_STACK_SIZE 0x1000U
+#define CONTROL_TASK_POLL_US 100U
+
+static unsigned char __attribute__((aligned(16))) g_controlTaskStack[CONTROL_TASK_STACK_SIZE];
+#endif
 
 /* ================================================================
  *  硬件句柄 (全局定义, 给 system_init 和各模块使用)
@@ -154,7 +175,7 @@ Motor_Stepper g_motor1 = {
 };
 
 /* ================================================================
- *  总线协议 (多板共线, 跳线 GPIO2_7/GPIO3_0 识别本板)
+ *  总线协议 (多板共线, 跳线 GPIO3_1/GPIO3_0 识别本板)
  *  帧: [AA][ID][CMD][父臂][数据][SUM]  SUM=除校验字节外累加 & 0xFF
  *  读: [AA][ID][01][父臂][SUM] (5字节) → 回 [AA][ID][世界角][SUM]
  *  写: [AA][ID][00][父臂][世界目标][SUM] (6字节) → 执行, 不应答
@@ -241,18 +262,18 @@ static void Bus_Reply(uint8_t id, float deg)
         deg = 0.0f;
     rep[0] = FRAME_HEADER;
     rep[1] = id;
-    rep[2] = (unsigned char)(deg + 0.5f);   /* 四舍五入 */
+    rep[2] = (unsigned char)(deg + 0.5f); /* 四舍五入 */
     if (rep[2] > 180)
         rep[2] = 180;
-    rep[3] = (unsigned char)(rep[0] + rep[1] + rep[2]);   /* SUM */
+    rep[3] = (unsigned char)(rep[0] + rep[1] + rep[2]); /* SUM */
     UartBus_TxMuxToUart();
-    HAL_UART_WriteBlocking(&g_uart1, rep, 4, 10000);   /* blockingTime 超时 */
+    HAL_UART_WriteBlocking(&g_uart1, rep, 4, 10000); /* blockingTime 超时 */
     UartBus_TxMuxToGpio();
 }
 
 /* 跳线 → 本板电机 ID 集合 (多板共线, 各板只响应自己的电机):
  *  跳线 00 → 电机04 (无刷单板) / 跳线 01 → 电机02+03 (双无刷板) / 跳线 10 → 电机01 (步进板)
- *  (bit0=GPIO3_0, bit1=GPIO2_7, 见 uart_bus.c UartBus_GetAddr) */
+ *  (bit0=GPIO3_0/PIN75, bit1=GPIO3_1/PIN76, 见 uart_bus.c UartBus_GetAddr) */
 static int Bus_IsMyMotor(uint8_t id)
 {
     switch (g_boardId) {                 /* 跳线分发 */
@@ -287,40 +308,81 @@ void GPIO5_3_IrqCallback(void *p)
 {
     (void)p;
     if (Bus_IsMyMotor(0x02))
-        BldcFb_Isr(&g_motor[0], BASE_FUNC_GetTick());   /* 双无刷板: 电机2 FG */
+        BldcFb_Isr(&g_motor[0], BASE_FUNC_GetTick()); /* 双无刷板: 电机2 FG */
     else if (Bus_IsMyMotor(0x04))
-        BldcFb_Isr(&g_motor[2], BASE_FUNC_GetTick());   /* 04板: 电机4 FG */
+        BldcFb_Isr(&g_motor[2], BASE_FUNC_GetTick()); /* 04板: 电机4 FG */
 }
 
 void GPIO6_2_IrqCallback(void *p)
 {
     (void)p;
     if (Bus_IsMyMotor(0x03))
-        BldcFb_Isr(&g_motor[1], BASE_FUNC_GetTick());   /* 双无刷板: 电机3 FG */
+        BldcFb_Isr(&g_motor[1], BASE_FUNC_GetTick()); /* 双无刷板: 电机3 FG */
 }
 
-static volatile uint8_t g_spdFlag = 0;  /* 5ms 速度环触发 (主循环消费) */
-static volatile uint8_t g_posFlag = 0;  /* 40ms 位置环触发 (8×5ms) */
-static uint8_t g_posCnt = 0;            /* 5ms→40ms 计数 */
-static volatile uint8_t g_telFlag = 0;  /* 500ms 遥测触发 */
-static uint16_t g_telCnt = 0;           /* 5ms→500ms 计数 */
-static uint16_t g_posRun = 0;           /* 位置环运行计数 (诊断: 恒定=没跑) */
-static uint16_t g_stallCnt[3] = {0};    /* 堵转计时 (每台电机) */
-static uint16_t g_noFg[3] = {0};        /* 无 FG 计时: 200ms 无 FG → 转速归零 */
+static volatile uint32_t g_speedReleaseSeq = 0;     /* TIMER1发布的5ms事件序号 */
+static volatile uint32_t g_positionReleaseSeq = 0;  /* TIMER1发布的20ms事件序号 */
+static volatile uint32_t g_speedReleaseTick = 0;    /* 最近一次5ms事件的硬件时间戳 */
+static volatile uint32_t g_positionReleaseTick = 0; /* 最近一次20ms事件的硬件时间戳 */
+static uint8_t g_posCnt = 0;                        /* 5ms→20ms计数 */
+static volatile uint8_t g_telFlag = 0;              /* 200ms遥测触发 */
+static uint16_t g_telCnt = 0;                       /* 5ms→200ms计数 */
+static uint32_t g_posRun = 0;                       /* 位置环运行计数 */
+static uint16_t g_stallCnt[3] = {0};                /* 堵转计时 (每台电机) */
+static uint16_t g_noFg[3] = {0};                    /* 无FG计时: 200ms无FG→转速归零 */
+static uint8_t g_stallRecovering[3] = {0};
+static uint32_t g_stallRecoveryStartTick[3] = {0};
 
-/* 5ms 控制时基 (TIMER1): ISR 只置标志 —— 环重活全在主循环 (ISR 要轻) */
+/* 阶段一调度诊断: 只在ControlTask写、mainTask低频读取打印。 */
+static volatile uint32_t g_speedRunCount = 0;
+static volatile uint32_t g_positionRunCount = 0;
+static volatile uint32_t g_speedMissCount = 0;
+static volatile uint32_t g_positionMissCount = 0;
+static volatile uint32_t g_speedMaxPending = 0;
+static volatile uint32_t g_positionMaxPending = 0;
+static volatile uint32_t g_speedMaxStartJitterUs = 0;
+static volatile uint32_t g_positionMaxStartJitterUs = 0;
+static volatile uint32_t g_speedMaxExecUs = 0;
+static volatile uint32_t g_positionMaxExecUs = 0;
+static volatile uint32_t g_controlMaxExecUs = 0;
+static volatile uint32_t g_speedDeadlineMissCount = 0;
+static volatile uint32_t g_positionDeadlineMissCount = 0;
+static volatile uint32_t g_controlOverrunCount = 0;
+static volatile uint32_t g_timerMaxPeriodJitterUs = 0;
+static uint32_t g_timerLastTick = 0;
+
+/* 5ms控制时基: ISR只发布时间戳和事件序号，控制运算由ControlTask完成。 */
 void SpeedLoop_ISR(void *p)
 {
+    uint32_t nowTick;
+    uint32_t periodTicks;
+    uint32_t jitterTicks;
+
     (void)p;
-    g_spdFlag = 1;
+    nowTick = BASE_FUNC_GetTick();
+
+    if (g_timerLastTick != 0U) {
+        periodTicks = nowTick - g_timerLastTick;
+        jitterTicks = (periodTicks >= SPEED_LOOP_PERIOD_TICKS) ?
+            (periodTicks - SPEED_LOOP_PERIOD_TICKS) : (SPEED_LOOP_PERIOD_TICKS - periodTicks);
+        if ((jitterTicks / CONTROL_TICKS_PER_US) > g_timerMaxPeriodJitterUs)
+            g_timerMaxPeriodJitterUs = jitterTicks / CONTROL_TICKS_PER_US;
+    }
+    g_timerLastTick = nowTick;
+
+    /* 先写时间戳、后递增序号，任务通过双读序号取得一致快照。 */
+    g_speedReleaseTick = nowTick;
+    g_speedReleaseSeq++;
+
     g_posCnt++;
-    if (g_posCnt >= 4) {            /* 4×5ms=20ms 位置环 (用户要求) */
+    if (g_posCnt >= POSITION_LOOP_DIV) { /* 4×5ms=20ms位置环 */
         g_posCnt = 0;
-        g_posFlag = 1;
+        g_positionReleaseTick = nowTick;
+        g_positionReleaseSeq++;
     }
 #if (DIAG_EN == 1)
     g_telCnt++;
-    if (g_telCnt >= 40) {           /* 40×5ms=200ms ADC 诊断 */
+    if (g_telCnt >= TELEMETRY_LOOP_DIV) { /* 40×5ms=200ms诊断 */
         g_telCnt = 0;
         g_telFlag = 1;
     }
@@ -331,7 +393,7 @@ void SpeedLoop_ISR(void *p)
 static void PosLoopOne(Motor_Bldc *m, int idx)
 {
     float pe = m->pos.target - g_degS[idx];
-    float lim = fabsf(pe) * 100.0f + 500.0f;   /* 动态积分限幅 */
+    float lim = fabsf(pe) * 100.0f + 500.0f; /* 动态积分限幅 */
     PIDCtrl_SetIntegralLimits(&m->spd.pid, -lim, lim);
     uint8_t dir;
     float spd = BldcPos_Exec(m, g_degS[idx], m->fb.updated, m->spd.enabled, &dir);
@@ -340,6 +402,145 @@ static void PosLoopOne(Motor_Bldc *m, int idx)
         m->spd.dir = dir;
     }
     BldcSpd_SetTarget(m, spd);
+}
+
+/* 堵转恢复原来在位置环内忙等50ms，会直接阻塞十个速度周期。
+ * 现在只记录状态，速度环每5ms检查到期时间，恢复期间保持PWM关闭。 */
+static int Motor_ServiceStallRecovery(Motor_Bldc *m, int idx, uint32_t nowTick)
+{
+    uint32_t recoveryTicks = STALL_RECOVERY_US * CONTROL_TICKS_PER_US;
+
+    if (g_stallRecovering[idx] == 0U)
+        return 0;
+
+    if ((nowTick - g_stallRecoveryStartTick[idx]) < recoveryTicks)
+        return 1;
+
+    if (m->frGpio)
+        HAL_GPIO_SetValue(m->frGpio, m->frPin, GPIO_LOW_LEVEL);
+    g_stallRecovering[idx] = 0U;
+    g_stallCnt[idx] = 0U;
+    return 0;
+}
+
+/* 5ms速度控制，一次只执行当前板拥有的无刷电机。 */
+static void Motor_RunSpeedLoop(void)
+{
+    int i;
+    uint32_t nowTick = BASE_FUNC_GetTick();
+
+    for (i = 0; i < 3; i++) {
+        Motor_Bldc *m;
+        float thw;
+
+        if (!Bus_IsMyMotor((uint8_t)(i + 2)))
+            continue;
+
+        m = &g_motor[i];
+        if (Motor_ServiceStallRecovery(m, i, nowTick))
+            continue;
+
+        /* 200ms无FG边沿则转速归零，防止反馈冻结在旧值。 */
+        if (m->fb.initialized && m->fb.rpm > 0.0f && !m->fb.updated) {
+            if (++g_noFg[i] >= 40U) {
+                m->fb.rpm = 0.0f;
+                g_noFg[i] = 0U;
+            }
+        } else {
+            g_noFg[i] = 0U;
+        }
+
+        BldcFb_Update(m);
+        thw = g_degS[i] * 0.0174533f;
+        BldcSpd_Run(m, 0.005f, thw);
+        Bldc_SetOutput(m, m->spd.duty, (uint8_t)(1U - m->spd.dir));
+    }
+}
+
+/* 20ms位置控制: 堵转检测、ADC采样、位置环计算。 */
+static void Motor_RunPositionLoop(void)
+{
+    int i;
+    uint16_t v;
+    float deg;
+    Motor_Bldc *m;
+
+    g_posRun++;
+
+    for (i = 0; i < 3; i++) {
+        Motor_Bldc *ms;
+
+        if (!Bus_IsMyMotor((uint8_t)(i + 2)))
+            continue;
+
+        ms = &g_motor[i];
+        if (g_stallRecovering[i] != 0U)
+            continue;
+
+        if (fabsf(ms->spd.cmdRpm) > 1.0f && !ms->fb.updated) {
+            if (++g_stallCnt[i] >= STALL_DETECT_POSITION_CYCLES) { /* 20ms×50=1s */
+                GPT_ReferCfg ref = {
+                    .refA0 = {.refdot = 0, .refAction = GPT_ACTION_OUTPUT_HIGH},
+                    .refB0 = {.refdot = 0, .refAction = GPT_ACTION_NO_ACTION}
+                };
+
+                if (ms->pwm)
+                    HAL_GPT_SetReferCounterAndAction(ms->pwm, &ref);
+                if (ms->frGpio)
+                    HAL_GPIO_SetValue(ms->frGpio, ms->frPin, GPIO_HIGH_LEVEL);
+
+                g_stallRecovering[i] = 1U;
+                g_stallRecoveryStartTick[i] = BASE_FUNC_GetTick();
+                g_stallCnt[i] = 0U;
+            }
+        } else {
+            g_stallCnt[i] = 0U;
+        }
+    }
+
+    /* M2: ADC3实测，局部角等于世界角。 */
+    if (Bus_IsMyMotor(0x02)) {
+        m = &g_motor[0];
+        ADC_Read(&g_adc3, &v);
+        g_adcRaw[0] = v;
+        deg = AngleToDeg(&g_cal[0], v);
+        g_degS[0] = g_degS[0] * 0.9f + deg * 0.1f;
+        PosLoopOne(m, 0);
+    }
+
+    /* M3: 世界角 = M2世界角 + M3局部角 - 90度。 */
+    if (Bus_IsMyMotor(0x03)) {
+        m = &g_motor[1];
+        ADC_Read(&g_adc2, &v);
+        g_adcRaw[1] = v;
+        deg = AngleToDeg(&g_cal[1], v);
+        g_degS[1] = g_degS[1] * 0.9f + (g_degS[0] + deg - g_aligned[1]) * 0.1f;
+        PosLoopOne(m, 1);
+    }
+
+    /* M4: 当前单关节板使用ADC3，父臂角仍按既有固定值处理。 */
+    if (Bus_IsMyMotor(0x04)) {
+        m = &g_motor[2];
+        ADC_Read(&g_adc3, &v);
+        g_adcRaw[2] = v;
+        deg = AngleToDeg(&g_cal[2], v);
+        g_degS[2] = g_degS[2] * 0.7f + (M4_M3_WORLD_DEG + deg - 90.0f) * 0.3f;
+        PosLoopOne(m, 2);
+    }
+}
+
+/* 步进电机相对角度命令: 协议传0~180度，内部按每步角换算为脉冲数。
+ * 无位置传感器闭环，因此这是“转动angle度”，不是“转到绝对angle度”。 */
+static void Stepper_RunRelativeAngle(uint8_t angle, uint8_t dir)
+{
+    unsigned int steps;
+
+    if (angle == 0U || angle > 180U || g_motor1.degPerStep <= 0.0f)
+        return;
+
+    steps = (unsigned int)((float)angle / g_motor1.degPerStep + 0.5f);
+    if (steps != 0U)
+        Stepper_Run(&g_motor1, steps, dir);
 }
 
 /* 串口字节泵: 只收总线帧 (0xAA 包头), 非帧首字节丢弃等同步
@@ -362,7 +563,8 @@ static void UartPump(void)
         if (g_frameLen < 3)
             continue;                 /* 还没到 CMD 字节, 继续收 */
         uint8_t cmd = g_frame[2];
-        if (cmd > 2) {
+        /* CMD03仅用于步进电机的反方向相对角度运动。 */
+        if (cmd > 3U || (cmd == 3U && g_frame[1] != 0x01U)) {
             g_frameLen = 0;           /* CMD 非法, 重新同步 */
             continue;
         }
@@ -387,7 +589,7 @@ static void UartPump(void)
             DBG_PRINTF(" %02X", g_frame[i]);
         DBG_PRINTF("%s\r\n", (calc == sum) ? " OK" : " FAIL");
 #endif
-        if (calc != sum || ((id != 0x01 || cmd != 0) && data > 180))
+        if (calc != sum || ((cmd == 0U || cmd == 3U) && data > 180U))
             continue;                 /* 校验失败/非法字段, 丢弃 */
 
         /* ② 急停 (CMD 02): 广播, 本板所有电机停止 (不受 ID/跳线限制), 不应答
@@ -405,48 +607,173 @@ static void UartPump(void)
             continue;
         }
 
-        /* ③ 跳线识别: 本板只响应跳线对应的电机 ID (00→01, 01→02+03, 10→04) */
+        /* ③ 跳线识别: 本板只响应跳线对应的电机 ID (00→04, 01→02+03, 10→01) */
         if (!Bus_IsMyMotor(id)) {
 #if (DIAG_EN == 1)
             DBG_PRINTF("rx: id=%u no (board=%u)\r\n", (unsigned int)id, (unsigned int)g_boardId);
 #endif
-            continue;                 /* 不是本板电机, 只收不应答 (TX 保持 GPIO 高阻) */
+            continue; /* 不是本板电机, 只收不应答 (TX 保持 GPIO 高阻) */
         }
         switch (cmd) {
-        case 1:   /* 读 → 只上报角度, 然后等待 */
+            case 1: /* 读 → 只上报角度, 然后等待 */
 #if (DIAG_EN == 1)
-            DBG_PRINTF("rx: m%u read\r\n", (unsigned int)id);
+                DBG_PRINTF("rx: m%u read\r\n", (unsigned int)id);
 #endif
-            if (id == 0x01)
-                Bus_Reply(id, Motor1_Angle());                  /* 步进: 局部角 */
-            else
-                Bus_Reply(id, Bus_WorldAngle(id, 0.0f));        /* 世界角 (缓存) */
-            break;
-        case 0:   /* 写 → data 即目标 (无父角, 钳位 0~180) */
-            if (id == 0x01) {
-                /* 电机1 (步进板 跳线00) */
-                /* 无电位器测试：收到电机1写指令后固定输出500个脉冲。 */
-                /* data: bit7=direction, bit6..0=pulse count (1..127). */
-                unsigned int steps = (unsigned int)(data & 0x7FU);
-                unsigned int dir = (unsigned int)((data >> 7) & 0x01U);
-                if (steps != 0U)
-                    Stepper_Run(&g_motor1, steps, dir);
-            } else if (id == 0x02) {
-                /* 电机2 (肩, 双无刷板 跳线01): 世界目标 (底座父臂=0) */
-                Bus_ServoWrite(0x02, data);
-            } else if (id == 0x03) {
-                /* 电机3 (肘, 双无刷板): 世界目标 (世界角闭环, 含 M2 实测) */
-                Bus_ServoWrite(0x03, data);
-            } else {
-                /* 电机4 (04 单关节板 跳线10): 独立关节目标 */
-                Bus_ServoWrite(0x04, data);
-            }
-            break;
-        default:
-            break;
+                if (id == 0x01)
+                    Bus_Reply(id, Motor1_Angle()); /* 步进: 局部角 */
+                else
+                    Bus_Reply(id, Bus_WorldAngle(id, 0.0f)); /* 世界角 (缓存) */
+                break;
+            case 0: /* 无刷目标角；步进电机方向0相对转动data度 */
+                if (id == 0x01) {
+                    /* 电机1 (步进板 跳线10) */
+                    Stepper_RunRelativeAngle(data, 0U);
+                } else if (id == 0x02) {
+                    /* 电机2 (肩, 双无刷板 跳线01): 世界目标 (底座父臂=0) */
+                    Bus_ServoWrite(0x02, data);
+                } else if (id == 0x03) {
+                    /* 电机3 (肘, 双无刷板): 世界目标 (世界角闭环, 含 M2 实测) */
+                    Bus_ServoWrite(0x03, data);
+                } else {
+                    /* 电机4 (04 单关节板 跳线00): 独立关节目标 */
+                    Bus_ServoWrite(0x04, data);
+                }
+                break;
+            case 3: /* 步进电机方向1相对转动data度 */
+                if (id == 0x01)
+                    Stepper_RunRelativeAngle(data, 1U);
+                break;
+            default:
+                break;
         }
     }
 }
+
+#ifdef NOS_TASK_SUPPORT
+/* TIMER1可能在任务读取期间更新数据，双读序号保证序号和时间戳来自同一事件。 */
+static void Timing_ReadRelease(const volatile uint32_t *seqAddr, const volatile uint32_t *tickAddr,
+                               uint32_t *seq, uint32_t *tick)
+{
+    uint32_t before;
+    uint32_t after;
+
+    do {
+        before = *seqAddr;
+        *tick = *tickAddr;
+        after = *seqAddr;
+    } while (before != after);
+
+    *seq = after;
+}
+
+static void ControlTask(void *param)
+{
+    uint32_t speedDoneSeq;
+    uint32_t positionDoneSeq;
+
+    (void)param;
+
+    /* 忽略SystemInit启动定时器到本任务开始之间的初始化事件。 */
+    speedDoneSeq = g_speedReleaseSeq;
+    positionDoneSeq = g_positionReleaseSeq;
+
+    while (1) {
+        uint32_t released;
+        uint32_t releaseTick;
+        uint32_t pending;
+        uint32_t startTick;
+        uint32_t endTick;
+        uint32_t elapsedUs;
+        uint32_t controlStartTick = 0U;
+        uint8_t didWork = 0U;
+
+        Timing_ReadRelease(&g_speedReleaseSeq, &g_speedReleaseTick, &released, &releaseTick);
+        pending = released - speedDoneSeq;
+        if (pending != 0U) {
+            if (pending > g_speedMaxPending)
+                g_speedMaxPending = pending;
+            if (pending > 1U)
+                g_speedMissCount += pending - 1U;
+
+            /* 过期控制周期不连续补跑，只执行最新一次并记录丢周期。 */
+            speedDoneSeq = released;
+            startTick = BASE_FUNC_GetTick();
+            controlStartTick = startTick;
+            didWork = 1U;
+
+            elapsedUs = (startTick - releaseTick) / CONTROL_TICKS_PER_US;
+            if (elapsedUs > g_speedMaxStartJitterUs)
+                g_speedMaxStartJitterUs = elapsedUs;
+
+            Motor_RunSpeedLoop();
+
+            endTick = BASE_FUNC_GetTick();
+            elapsedUs = (endTick - startTick) / CONTROL_TICKS_PER_US;
+            if (elapsedUs > g_speedMaxExecUs)
+                g_speedMaxExecUs = elapsedUs;
+            if ((endTick - releaseTick) > SPEED_LOOP_PERIOD_TICKS)
+                g_speedDeadlineMissCount++;
+            g_speedRunCount++;
+        }
+
+        Timing_ReadRelease(&g_positionReleaseSeq, &g_positionReleaseTick, &released, &releaseTick);
+        pending = released - positionDoneSeq;
+        if (pending != 0U) {
+            if (pending > g_positionMaxPending)
+                g_positionMaxPending = pending;
+            if (pending > 1U)
+                g_positionMissCount += pending - 1U;
+
+            positionDoneSeq = released;
+            startTick = BASE_FUNC_GetTick();
+            if (didWork == 0U)
+                controlStartTick = startTick;
+            didWork = 1U;
+
+            elapsedUs = (startTick - releaseTick) / CONTROL_TICKS_PER_US;
+            if (elapsedUs > g_positionMaxStartJitterUs)
+                g_positionMaxStartJitterUs = elapsedUs;
+
+            Motor_RunPositionLoop();
+
+            endTick = BASE_FUNC_GetTick();
+            elapsedUs = (endTick - startTick) / CONTROL_TICKS_PER_US;
+            if (elapsedUs > g_positionMaxExecUs)
+                g_positionMaxExecUs = elapsedUs;
+            if ((endTick - releaseTick) > (POSITION_LOOP_DIV * SPEED_LOOP_PERIOD_TICKS))
+                g_positionDeadlineMissCount++;
+            g_positionRunCount++;
+        }
+
+        if (didWork != 0U) {
+            endTick = BASE_FUNC_GetTick();
+            elapsedUs = (endTick - controlStartTick) / CONTROL_TICKS_PER_US;
+            if (elapsedUs > g_controlMaxExecUs)
+                g_controlMaxExecUs = elapsedUs;
+            if ((endTick - controlStartTick) > SPEED_LOOP_PERIOD_TICKS)
+                g_controlOverrunCount++;
+        }
+
+        (void)NOS_TaskDelay(CONTROL_TASK_POLL_US);
+    }
+}
+
+static int ControlTask_Create(void)
+{
+    unsigned int taskId;
+    NOS_TaskInitParam param = {0};
+
+    param.name = "controlTask";
+    param.taskEntry = ControlTask;
+    param.param = 0;
+    param.priority = 1U;
+    param.stackAddr = (unsigned int)g_controlTaskStack;
+    param.stackSize = sizeof(g_controlTaskStack);
+    param.privateData = 0U;
+
+    return NOS_TaskCreate(&param, &taskId);
+}
+#endif
 
 /* ================================================================
  *  main
@@ -454,7 +781,10 @@ static void UartPump(void)
 int main(void)
 {
     int i;
-
+#ifdef NOS_TASK_SUPPORT
+    int controlTaskRet;
+    uint8_t timingPrintDiv = 0U;
+#endif
     SystemInit();
     DBG_UartPrintInit(115200);
     DBG_PRINTF("3board cascade pid servo\r\n");
@@ -463,11 +793,11 @@ int main(void)
     HAL_GPT_Start(&g_gptHandle1);
 
     UART_Ring_Init();
-    UartBus_Init();   /* 总线地址脚 (GPIO2_7/GPIO3_0) + TX 默认切 GPIO (不驱动总线) */
+    UartBus_Init(); /* 总线地址脚 (GPIO3_1/GPIO3_0) + TX 默认切 GPIO (不驱动总线) */
 
-    /* 本板地址 (跳线 GPIO2_7/GPIO3_0): 决定本板响应哪些电机 (00→04, 01→02+03, 10→01) */
-    // g_boardId = UartBus_GetAddr();
-    g_boardId=0x02;
+    /* 本板地址 (跳线 GPIO3_1/GPIO3_0): 决定本板响应哪些电机 (00→04, 01→02+03, 10→01) */
+    g_boardId = UartBus_GetAddr();
+    // g_boardId = 0x02;
     DBG_PRINTF("board id=%u\r\n", (unsigned int)g_boardId);
 
     /* 上电解锁: 本驱动 IC 上电 BK 低会进保护锁存, FR 翻转一次清掉, 否则开环起步转不动 */
@@ -478,111 +808,66 @@ int main(void)
     }
     DBG_PRINTF("ready\r\n");
 
+#ifdef NOS_TASK_SUPPORT
+    controlTaskRet = ControlTask_Create();
+    DBG_PRINTF("control task create ret=%d\r\n", controlTaskRet);
+
+    /* 控制任务创建失败时保持安全停止，不再进入业务循环。 */
+    if (controlTaskRet != 0) {
+        for (i = 0; i < 3; i++)
+            Bldc_Stop(&g_motor[i]);
+        Stepper_Stop(&g_motor1);
+        DBG_PRINTF("FATAL: control task unavailable\r\n");
+        while (1)
+            (void)NOS_TaskDelay(1000000U);
+    }
+#endif
+
     while (1) {
-        /* 5ms 速度环: 本板电机 堵转检测 → 测速 → 速度 PI → 输出落硬件 */
-        if (g_spdFlag) {
-            g_spdFlag = 0;
-            for (i = 0; i < 3; i++) {
-                if (!Bus_IsMyMotor((uint8_t)(i + 2)))
-                    continue;                 /* 只跑本板电机 (跳线分板) */
-                Motor_Bldc *m = &g_motor[i];
-                /* 无 FG 归零: 电机停后 rpmFb 冻结在旧值 → err 恒负 → kp·err 压输出 → 推不动.
-                 * 200ms 无 FG 边沿 → 转速归零 (正常转时 FG 每 ~48ms 一个边沿, 不误归零) */
-                if (m->fb.initialized && m->fb.rpm > 0.0f && !m->fb.updated) {
-                    if (++g_noFg[i] >= 40) {
-                        m->fb.rpm = 0.0f;
-                        g_noFg[i] = 0;
-                    }
-                } else {
-                    g_noFg[i] = 0;
-                }
-                BldcFb_Update(m);
-                /* 重力补偿用世界角: g_degS 已按各电机存世界角
-                 * (M3 的 θ3w=θ2+θ3−90 由位置环每拍算好, 含 M2 实测) */
-                float thw = g_degS[i] * 0.0174533f;
-                BldcSpd_Run(m, 0.005f, thw);
-                /* 方向适配: 实测 FR LOW=减角 (14:59 铁证: 增角指令下 FR LOW 电机减角),
-                 * 增角需 FR HIGH — userPID完成 原样 out≥0→FR LOW 在当前硬件取反 */
-                Bldc_SetOutput(m, m->spd.duty, (uint8_t)(1 - m->spd.dir));
-            }
-        }
-        /* 40ms 位置环: 显式读本板电机 ADC → 三点标定 → 位置 P → 速度目标
-         * 双无刷板 (跳线01): 同拍先 M2 (ADC3) 后 M3 (ADC2) — M3 世界角用刚刷新的 M2
-         *   (速度环的 θ3w=θ2+θ3−90 依赖此顺序, 双轴互注同拍无延迟)
-         * 04板 (跳线00): M4 独立关节 (ADC3, 父臂=M3 写死 M4_M3_WORLD_DEG)
-         * 步进板 (跳线10): 无无刷位置环 */
-        if (g_posFlag) {
-            g_posFlag = 0;
-            g_posRun++;
-            for (i = 0; i < 3; i++) {
-                if (!Bus_IsMyMotor((uint8_t)(i + 2)))
-                    continue;
-                Motor_Bldc *ms = &g_motor[i];
-                if (fabsf(ms->spd.cmdRpm) > 1.0f && !ms->fb.updated) {
-                    if (++g_stallCnt[i] >= 50) {   /* 20ms×50=1s */
-                        GPT_ReferCfg ref = {.refA0 = {.refdot = 0, .refAction = GPT_ACTION_OUTPUT_HIGH},
-                                            .refB0 = {.refdot = 0, .refAction = GPT_ACTION_NO_ACTION}};
-                        if (ms->pwm)
-                            HAL_GPT_SetReferCounterAndAction(ms->pwm, &ref);   /* PWM 全关 */
-                        if (ms->frGpio)
-                            HAL_GPIO_SetValue(ms->frGpio, ms->frPin, GPIO_HIGH_LEVEL);  /* FR 翻转 */
-                        BASE_FUNC_DELAY_MS(50);
-                        if (ms->frGpio)
-                            HAL_GPIO_SetValue(ms->frGpio, ms->frPin, GPIO_LOW_LEVEL);
-                        g_stallCnt[i] = 0;
-                    }
-                } else {
-                    g_stallCnt[i] = 0;
-                }
-            }
-            uint16_t v;
-            float deg;
-            Motor_Bldc *m;
-            /* M2 (肩): 板内 ADC3 实测 → 局部 = 世界 (底座父臂=0) — EMA 平滑抗 ADC 噪声 */
-            if (Bus_IsMyMotor(0x02)) {
-                m = &g_motor[0];
-                ADC_Read(&g_adc3, &v);
-                g_adcRaw[0] = v;
-                deg = AngleToDeg(&g_cal[0], v);
-                g_degS[0] = g_degS[0] * 0.9f + deg * 0.1f;   /* EMA 0.9/0.1 */
-                PosLoopOne(m, 0);
-            }
-            /* M3 (肘): ADC2 → 局部 → 世界角 θ3w = M2(刚刷新) + θ3 − 90 */
-            if (Bus_IsMyMotor(0x03)) {
-                m = &g_motor[1];
-                ADC_Read(&g_adc2, &v);
-                g_adcRaw[1] = v;
-                deg = AngleToDeg(&g_cal[1], v);
-                g_degS[1] = g_degS[1] * 0.9f + (g_degS[0] + deg - g_aligned[1]) * 0.1f;   /* EMA 0.9/0.1 */
-                PosLoopOne(m, 1);
-            }
-            /* M4 (04板): ADC3 → 独立关节, 世界角 = M3 写死 90° + 局部 − 90 (=局部) — EMA 0.7/0.3
-             * (04 板载 ADC0 有问题, 电位器实际走 ADC3) */
-            if (Bus_IsMyMotor(0x04)) {
-                m = &g_motor[2];
-                ADC_Read(&g_adc3, &v);
-                g_adcRaw[2] = v;
-                deg = AngleToDeg(&g_cal[2], v);
-                g_degS[2] = g_degS[2] * 0.7f + (M4_M3_WORLD_DEG + deg - 90.0f) * 0.3f;
-                PosLoopOne(m, 2);
-            }
-        }
         /* 串口: 总线帧 (0xAA 包头) */
         UartPump();
 #if (DIAG_EN == 1)
         /* 遥测: 每 200ms — 电机状态 (cur/tgt + kp/ki/积分/actRpm/duty/cmd/rpm) */
         if (g_telFlag) {
             g_telFlag = 0;
+// #ifdef NOS_TASK_SUPPORT
+//             if (++timingPrintDiv >= 5U) {
+//                 timingPrintDiv = 0U;
+//                 DBG_PRINTF("timing timerJitMax=%uus controlExecMax=%uus controlOverrun=%u\r\n",
+//                            (unsigned int)g_timerMaxPeriodJitterUs,
+//                            (unsigned int)g_controlMaxExecUs,
+//                            (unsigned int)g_controlOverrunCount);
+//                 DBG_PRINTF("timing spd rel=%u run=%u miss=%u pendMax=%u startMax=%uus execMax=%uus deadline=%u\r\n",
+//                            (unsigned int)g_speedReleaseSeq,
+//                            (unsigned int)g_speedRunCount,
+//                            (unsigned int)g_speedMissCount,
+//                            (unsigned int)g_speedMaxPending,
+//                            (unsigned int)g_speedMaxStartJitterUs,
+//                            (unsigned int)g_speedMaxExecUs,
+//                            (unsigned int)g_speedDeadlineMissCount);
+//                 DBG_PRINTF("timing pos rel=%u run=%u miss=%u pendMax=%u startMax=%uus execMax=%uus deadline=%u\r\n",
+//                            (unsigned int)g_positionReleaseSeq,
+//                            (unsigned int)g_positionRunCount,
+//                            (unsigned int)g_positionMissCount,
+//                            (unsigned int)g_positionMaxPending,
+//                            (unsigned int)g_positionMaxStartJitterUs,
+//                            (unsigned int)g_positionMaxExecUs,
+//                            (unsigned int)g_positionDeadlineMissCount);
+//             }
+// #endif
             for (i = 0; i < 3; i++) {
                 if (Bus_IsMyMotor((uint8_t)(i + 2))) {
                     Motor_Bldc *m = &g_motor[i];
-                    DBG_PRINTF("m%u cur=%.1f tgt=%.1f adc=%u duty=%u rpm=%.0f\r\n",
-                               (unsigned int)(i + 2), g_degS[i], m->pos.target,
-                               g_adcRaw[i], m->spd.duty, m->fb.rpm);
+                    DBG_PRINTF("m%u cur=%.1f tgt=%.1f adc=%u duty=%u rpm=%.0f\r\n", (unsigned int)(i + 2), g_degS[i],
+                               m->pos.target, g_adcRaw[i], m->spd.duty, m->fb.rpm);
                 }
             }
         }
 #endif
+#ifdef NOS_TASK_SUPPORT
+        (void)NOS_TaskDelay(1000U);
+#else
         BASE_FUNC_DELAY_MS(1);
+#endif
     }
 }

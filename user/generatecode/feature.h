@@ -7,7 +7,7 @@
 #define CHIP_3066HAPIMM MACRO_ENABLE
 
 /* Enable the NOS task scheduler. */
-// #define NOS_TASK_SUPPORT
+#define NOS_TASK_SUPPORT
 
 #define BASE_DEFINE_USE_ASSERT MACRO_ENABLE
 #ifndef FLASH_CRC_CONFIG

@@ -3,22 +3,29 @@
 
 /* ============================================================
  * 本板地址: 2 位拨码/跳线 (高=1, 低=0)
- *   bit0 = GPIO3_0, bit1 = GPIO2_7
+ *   SWITCH0: PIN75 / GPIO3_0 / bit0
+ *   SWITCH1: PIN76 / GPIO3_1 / bit1
  *   若硬件反接(下拉=1), 把下面的 GPIO_HIGH_LEVEL 换成 GPIO_LOW_LEVEL
  * ============================================================ */
 #define ADDR_PIN_BIT0   GPIO_PIN_0   /* GPIO3_0 → 地址 bit0 */
-#define ADDR_PIN_BIT1   GPIO_PIN_7   /* GPIO2_7 → 地址 bit1 */
+#define ADDR_PIN_BIT1   GPIO_PIN_1   /* GPIO3_1 → 地址 bit1 */
 
 static GPIO_Handle s_addrBit0;   /* GPIO3 */
-static GPIO_Handle s_addrBit1;   /* GPIO2 */
+static GPIO_Handle s_addrBit1;   /* GPIO3 */
 static GPIO_Handle s_txPin;      /* GPIO1_2 (仅方向控制) */
 
 void UartBus_Init(void)
 {
     /* 地址脚时钟 (system_init 已不再初始化 GPIO3, 这里自给自足) */
-    HAL_CRG_IpEnableSet(GPIO2_BASE, IP_CLK_ENABLE);
     HAL_CRG_IpEnableSet(GPIO3_BASE, IP_CLK_ENABLE);
 
+    /* SWITCH0: PIN75 / GPIO3_0 / 地址bit0 */
+    HAL_IOCMG_SetPinAltFuncMode(GPIO3_0_AS_GPIO3_0);
+    HAL_IOCMG_SetPinPullMode(GPIO3_0_AS_GPIO3_0, PULL_NONE);
+
+    /* SWITCH1: PIN76 / GPIO3_1 / 地址bit1 */
+    HAL_IOCMG_SetPinAltFuncMode(GPIO3_1_AS_GPIO3_1);
+    HAL_IOCMG_SetPinPullMode(GPIO3_1_AS_GPIO3_1, PULL_NONE);
     /* 地址脚: GPIO3_0 输入 */
     s_addrBit0.baseAddress = GPIO3;
     s_addrBit0.pins = ADDR_PIN_BIT0;
@@ -26,8 +33,8 @@ void UartBus_Init(void)
     HAL_GPIO_SetDirection(&s_addrBit0, ADDR_PIN_BIT0, GPIO_INPUT_MODE);
     HAL_GPIO_SetIrqType(&s_addrBit0, ADDR_PIN_BIT0, GPIO_INT_TYPE_NONE);
 
-    /* 地址脚: GPIO2_7 输入 */
-    s_addrBit1.baseAddress = GPIO2;
+    /* 地址脚: GPIO3_1 输入 */
+    s_addrBit1.baseAddress = GPIO3;
     s_addrBit1.pins = ADDR_PIN_BIT1;
     HAL_GPIO_Init(&s_addrBit1);
     HAL_GPIO_SetDirection(&s_addrBit1, ADDR_PIN_BIT1, GPIO_INPUT_MODE);
