@@ -45,8 +45,14 @@
 #ifdef NOS_TASK_SUPPORT
 #define CONTROL_TASK_STACK_SIZE 0x1000U
 #define CONTROL_TASK_POLL_US 100U
+#define STEPPER_TASK_STACK_SIZE 0x800U
+#define STEPPER_TASK_POLL_US 500U
+#define UART_TASK_STACK_SIZE 0x800U
+#define UART_TASK_POLL_US 500U
 
 static unsigned char __attribute__((aligned(16))) g_controlTaskStack[CONTROL_TASK_STACK_SIZE];
+static unsigned char __attribute__((aligned(16))) g_stepperTaskStack[STEPPER_TASK_STACK_SIZE];
+static unsigned char __attribute__((aligned(16))) g_uartTaskStack[UART_TASK_STACK_SIZE];
 #endif
 
 /* ================================================================
@@ -548,6 +554,72 @@ static void Stepper_RunRelativeAngle(uint8_t angle, uint8_t dir)
  * 读: 只上报角度, 不需要 PID, 报完等待下一帧
  * 写: 局部目标 = 世界 − 父臂 + 顺齐偏移, 转执行
  * 非本板电机 → 只收不应答 (TX 保持 GPIO 高阻) */
+#ifdef NOS_TASK_SUPPORT
+typedef enum {
+    MOTOR_CMD_MOVE = 0
+} MotorCommandType;
+
+typedef struct {
+    MotorCommandType type;
+    uint8_t motorId;
+    uint8_t direction;
+    uint16_t angle;
+} MotorCommand;
+
+/*
+ * Latest-command mailbox:
+ * UartTask overwrites the pending command, while StepperTask consumes only
+ * the newest snapshot after the current movement completes.
+ */
+static MotorCommand g_stepperLatestCommand;
+static volatile uint32_t g_stepperCommandWriteSeq = 0U;
+static volatile uint32_t g_stepperCommandReadSeq = 0U;
+static volatile uint8_t g_stepperStopRequest = 0U;
+
+static void MotorCommand_Update(const MotorCommand *cmd)
+{
+    if (cmd == NULL)
+        return;
+
+    g_stepperLatestCommand = *cmd;
+    g_stepperCommandWriteSeq++;
+}
+
+static int MotorCommand_TakeLatest(MotorCommand *cmd)
+{
+    uint32_t before;
+    uint32_t after;
+
+    if (cmd == NULL || g_stepperCommandReadSeq == g_stepperCommandWriteSeq)
+        return -1;
+
+    do {
+        before = g_stepperCommandWriteSeq;
+        *cmd = g_stepperLatestCommand;
+        after = g_stepperCommandWriteSeq;
+    } while (before != after);
+
+    g_stepperCommandReadSeq = after;
+    return 0;
+}
+
+static void MotorCommand_Clear(void)
+{
+    g_stepperCommandReadSeq = g_stepperCommandWriteSeq;
+}
+
+static void StepperCommand_Update(uint8_t angle, uint8_t direction)
+{
+    MotorCommand cmd;
+
+    cmd.type = MOTOR_CMD_MOVE;
+    cmd.motorId = 0x01U;
+    cmd.direction = direction;
+    cmd.angle = angle;
+    MotorCommand_Update(&cmd);
+}
+#endif
+
 static void UartPump(void)
 {
     while (UART_Ring_HasData()) {
@@ -603,7 +675,12 @@ static void UartPump(void)
                 if (Bus_IsMyMotor((uint8_t)(i + 2)))
                     Bldc_Stop(&g_motor[i]);
             }
+#ifdef NOS_TASK_SUPPORT
+            if (Bus_IsMyMotor(0x01U))
+                g_stepperStopRequest = 1U;
+#else
             Stepper_Stop(&g_motor1);
+#endif
             continue;
         }
 
@@ -627,7 +704,11 @@ static void UartPump(void)
             case 0: /* 无刷目标角；步进电机方向0相对转动data度 */
                 if (id == 0x01) {
                     /* 电机1 (步进板 跳线10) */
+#ifdef NOS_TASK_SUPPORT
+                    StepperCommand_Update(data, 0U);
+#else
                     Stepper_RunRelativeAngle(data, 0U);
+#endif
                 } else if (id == 0x02) {
                     /* 电机2 (肩, 双无刷板 跳线01): 世界目标 (底座父臂=0) */
                     Bus_ServoWrite(0x02, data);
@@ -640,8 +721,13 @@ static void UartPump(void)
                 }
                 break;
             case 3: /* 步进电机方向1相对转动data度 */
-                if (id == 0x01)
+                if (id == 0x01) {
+#ifdef NOS_TASK_SUPPORT
+                    StepperCommand_Update(data, 1U);
+#else
                     Stepper_RunRelativeAngle(data, 1U);
+#endif
+                }
                 break;
             default:
                 break;
@@ -651,6 +737,94 @@ static void UartPump(void)
 
 #ifdef NOS_TASK_SUPPORT
 /* TIMER1可能在任务读取期间更新数据，双读序号保证序号和时间戳来自同一事件。 */
+static void StepperTask(void *param)
+{
+    MotorCommand cmd;
+    unsigned int lastDoneSeq;
+
+    (void)param;
+    lastDoneSeq = Stepper_GetDoneSeq();
+
+    while (1) {
+        unsigned int doneSeq;
+
+        /* Emergency stop discards the pending latest movement command. */
+        if (g_stepperStopRequest != 0U) {
+            g_stepperStopRequest = 0U;
+            MotorCommand_Clear();
+            Stepper_Stop(&g_motor1);
+#if (DIAG_EN == 1)
+            DBG_PRINTF("step stop\r\n");
+#endif
+        }
+
+        doneSeq = Stepper_GetDoneSeq();
+        if (doneSeq != lastDoneSeq) {
+            lastDoneSeq = doneSeq;
+#if (DIAG_EN == 1)
+            DBG_PRINTF("step done: steps=%u\r\n",
+                       Stepper_GetLastCompletedSteps());
+#endif
+        }
+
+        /* Finish the active move, then consume only the newest pending command. */
+        if (Stepper_IsBusy() == 0U && MotorCommand_TakeLatest(&cmd) == 0) {
+            if (cmd.type == MOTOR_CMD_MOVE && cmd.motorId == 0x01U) {
+#if (DIAG_EN == 1)
+                DBG_PRINTF("step start: angle=%u dir=%u\r\n",
+                           (unsigned int)cmd.angle,
+                           (unsigned int)cmd.direction);
+#endif
+                Stepper_RunRelativeAngle((uint8_t)cmd.angle, cmd.direction);
+            }
+        }
+
+        (void)NOS_TaskDelay(STEPPER_TASK_POLL_US);
+    }
+}
+
+static void UartTask(void *param)
+{
+    (void)param;
+
+    while (1) {
+        UartPump();
+        (void)NOS_TaskDelay(UART_TASK_POLL_US);
+    }
+}
+
+static int StepperTask_Create(void)
+{
+    unsigned int taskId;
+    NOS_TaskInitParam param = {0};
+
+    param.name = "stepperTask";
+    param.taskEntry = StepperTask;
+    param.param = 0;
+    param.priority = 2U;
+    param.stackAddr = (unsigned int)g_stepperTaskStack;
+    param.stackSize = sizeof(g_stepperTaskStack);
+    param.privateData = 0U;
+
+    return NOS_TaskCreate(&param, &taskId);
+}
+
+static int UartTask_Create(void)
+{
+    unsigned int taskId;
+    NOS_TaskInitParam param = {0};
+
+    param.name = "uartTask";
+    param.taskEntry = UartTask;
+    param.param = 0;
+    param.priority = 3U;
+    param.stackAddr = (unsigned int)g_uartTaskStack;
+    param.stackSize = sizeof(g_uartTaskStack);
+    param.privateData = 0U;
+
+    return NOS_TaskCreate(&param, &taskId);
+}
+
 static void Timing_ReadRelease(const volatile uint32_t *seqAddr, const volatile uint32_t *tickAddr,
                                uint32_t *seq, uint32_t *tick)
 {
@@ -783,7 +957,8 @@ int main(void)
     int i;
 #ifdef NOS_TASK_SUPPORT
     int controlTaskRet;
-    uint8_t timingPrintDiv = 0U;
+    int stepperTaskRet = -1;
+    int uartTaskRet = -1;
 #endif
     SystemInit();
     DBG_UartPrintInit(115200);
@@ -812,12 +987,24 @@ int main(void)
     controlTaskRet = ControlTask_Create();
     DBG_PRINTF("control task create ret=%d\r\n", controlTaskRet);
 
+    if (controlTaskRet == 0) {
+        /* Only the board owning motor ID 01 needs a stepper task. */
+        stepperTaskRet = 0;
+        if (Bus_IsMyMotor(0x01U))
+            stepperTaskRet = StepperTask_Create();
+        DBG_PRINTF("stepper task create ret=%d\r\n", stepperTaskRet);
+
+        if (stepperTaskRet == 0)
+            uartTaskRet = UartTask_Create();
+        DBG_PRINTF("uart task create ret=%d\r\n", uartTaskRet);
+    }
+
     /* 控制任务创建失败时保持安全停止，不再进入业务循环。 */
-    if (controlTaskRet != 0) {
+    if (controlTaskRet != 0 || stepperTaskRet != 0 || uartTaskRet != 0) {
         for (i = 0; i < 3; i++)
             Bldc_Stop(&g_motor[i]);
         Stepper_Stop(&g_motor1);
-        DBG_PRINTF("FATAL: control task unavailable\r\n");
+        DBG_PRINTF("FATAL: required task unavailable\r\n");
         while (1)
             (void)NOS_TaskDelay(1000000U);
     }
@@ -825,7 +1012,9 @@ int main(void)
 
     while (1) {
         /* 串口: 总线帧 (0xAA 包头) */
+#ifndef NOS_TASK_SUPPORT
         UartPump();
+#endif
 #if (DIAG_EN == 1)
         /* 遥测: 每 200ms — 电机状态 (cur/tgt + kp/ki/积分/actRpm/duty/cmd/rpm) */
         if (g_telFlag) {

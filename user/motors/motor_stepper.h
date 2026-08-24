@@ -39,6 +39,11 @@ void Stepper_Run(Motor_Stepper *m, unsigned int steps, unsigned int dir);
 
 void Stepper_Stop(Motor_Stepper *m);
 
+/* Non-blocking status updated by the APT pulse callback. */
+unsigned int Stepper_IsBusy(void);
+unsigned int Stepper_GetDoneSeq(void);
+unsigned int Stepper_GetLastCompletedSteps(void);
+
 /* 高级接口: 跑到目标角度 (内部读 ADC → 算步数 → 调 Stepper_Run) */
 void Stepper_RunToAngle(Motor_Stepper *m, float targetDeg);
 
