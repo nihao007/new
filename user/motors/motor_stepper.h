@@ -37,6 +37,9 @@ typedef struct {
 
 void Stepper_Run(Motor_Stepper *m, unsigned int steps, unsigned int dir);
 
+/* Set output-shaft speed in degrees/second before starting a move. */
+uint8_t Stepper_SetSpeedDps(Motor_Stepper *m, uint8_t speedDps);
+
 void Stepper_Stop(Motor_Stepper *m);
 
 /* Non-blocking status updated by the APT pulse callback. */

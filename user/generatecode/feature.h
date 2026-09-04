@@ -6,6 +6,9 @@
 
 #define CHIP_3066HAPIMM MACRO_ENABLE
 
+/* This firmware image runs on CPU0. */
+#define APP_CORE_ID 0U
+
 /* Enable the NOS task scheduler. */
 #define NOS_TASK_SUPPORT
 

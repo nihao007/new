@@ -486,15 +486,16 @@ static void APT0_Init(void)
 
     /* 分频到 1MHz → UP_DOWN 周期=2×5000 → 100Hz */
     g_aptStepper.waveform.dividerFactor = aptClk / 1000000U - 1;
-    g_aptStepper.waveform.timerPeriod = 5000;       /* 2×5000/1MHz = 10ms = 100Hz */
+    // g_aptStepper.waveform.timerPeriod = 5000;       /* 2×5000/1MHz = 10ms = 100Hz */
+    g_aptStepper.waveform.timerPeriod =2500;
     g_aptStepper.waveform.cntMode = APT_COUNT_MODE_UP_DOWN;
     g_aptStepper.waveform.basicType = APT_PWM_BASIC_A_HIGH_B_LOW;
     g_aptStepper.waveform.chAOutType = APT_PWM_OUT_BASIC_TYPE;
     g_aptStepper.waveform.chBOutType = APT_PWM_OUT_BASIC_TYPE;
     g_aptStepper.waveform.divInitVal = 0;
     g_aptStepper.waveform.cntInitVal = 0;
-    g_aptStepper.waveform.cntCmpLeftEdge = 2500;    /* 50% 占空比 */
-    g_aptStepper.waveform.cntCmpRightEdge = 2500;
+    g_aptStepper.waveform.cntCmpLeftEdge = 1250;    /* 50% 占空比 */
+    g_aptStepper.waveform.cntCmpRightEdge = 1250;
     g_aptStepper.waveform.cntCmpLoadMode = APT_BUFFER_INDEPENDENT_LOAD;
     g_aptStepper.waveform.cntCmpLoadEvt = APT_COMPARE_LOAD_EVENT_ZERO;
     g_aptStepper.waveform.deadBandCnt = 0;

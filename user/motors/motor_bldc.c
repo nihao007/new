@@ -164,14 +164,18 @@ void BldcSpd_SetTarget(Motor_Bldc *m, float rpm)
 void BldcSpd_Run(Motor_Bldc *m, float ts, float thetaRad)
 {
     BldcSpd_State *s = &m->spd;
-    float grav, err, out;
+    float grav, err, out,angle;
 
     if (!s->enabled) {
         s->duty = 0;
         return;
     }
 
-    grav = s->gravBase * cosf(thetaRad);
+     //修改：去掉重力补偿
+    // grav = s->gravBase * cosf(thetaRad);
+    if(thetaRad>=90) angle=180.0-thetaRad;
+    else angle=thetaRad;
+    grav = s->gravBase * cosf(angle);
 
     /* — cmdRpm 斜坡滤波: 限制位置环指令跳变 — */
     if (s->cmdRpm < s->cmdTarget - 0.5f)
@@ -182,9 +186,10 @@ void BldcSpd_Run(Motor_Bldc *m, float ts, float thetaRad)
         s->cmdRpm = s->cmdTarget;
 
     /* — Hold 模式: 目标≈0 — */
-    if (fabsf(s->cmdRpm) < 1.0f) {
-        if (s->pid.integral < grav)
-            s->pid.integral = grav;      /* 积分锁底=重力 — 保持力=重力补偿 */
+     if (fabsf(s->cmdRpm) < 1.0f) {
+        //修改：去掉重力补偿
+        // if (s->pid.integral < grav)
+        //     s->pid.integral = grav;      /* 积分锁底=重力 — 保持力=重力补偿 */
         out = s->pid.integral;
         s->duty = (uint16_t)CLAMP(out, 0, DUTY_MAX);
         return;
@@ -208,28 +213,63 @@ void BldcSpd_Run(Motor_Bldc *m, float ts, float thetaRad)
     /* — 下坡超速反向制动: 重力加速 (cmd 与 to90 异号) 且转速超目标 → FR 翻转主动刹车.
      * 下降时 grav 应托举 (增角) 防掉 — userPID完成 原样无此机制, PI 用 |actRpm|
      * 刹不住 → 下降抖动 (速度环与重力前馈打架) — */
-    if (s->cmdRpm * (1.5707963f - thetaRad) < 0.0f
-        && BldcFb_GetRpm(m) > fabsf(s->actRpm) + 300.0f) {   /* 阈值 300: 只在明显超速时制动, 防低速爬升误触发 */
-        out = (BldcFb_GetRpm(m) - fabsf(s->actRpm)) * 1.0f;
-        if (out > DUTY_MAX) out = DUTY_MAX;
-        s->dir = (s->cmdRpm >= 0) ? 1 : 0;   /* 反向 (main.c 取反: 下降→增角托举制动) */
-        s->duty = (uint16_t)CLAMP(out, 0, DUTY_MAX);
-        return;
-    }
+    // if (s->cmdRpm * (1.5707963f - thetaRad) < 0.0f
+    //     && BldcFb_GetRpm(m) > fabsf(s->actRpm) + 300.0f) {   /* 阈值 300: 只在明显超速时制动, 防低速爬升误触发 */
+    //     out = (BldcFb_GetRpm(m) - fabsf(s->actRpm)) * 1.0f;
+    //     if (out > DUTY_MAX) out = DUTY_MAX;
+    //     s->dir = (s->cmdRpm >= 0) ? 1 : 0;   /* 反向 (main.c 取反: 下降→增角托举制动) */
+    //     s->duty = (uint16_t)CLAMP(out, 0, DUTY_MAX);
+    //     return;
+    // }
 
     /* — PI 控制: 重力作为积分基底 (积分锁底=grav, 量级一致; 1 平衡点 cos 外推标定) — */
     err = fabsf(s->actRpm) - BldcFb_GetRpm(m);
     if (err < -150.0f) err = -150.0f;   /* 超速泄压限幅: 防 kp·err 大负抵消重力/翻转方向 (转一下停一下振荡) */
     float piOut = PIDCtrl_Exec(&s->pid, err, 0, ts);   /* 速度误差积分 + 限幅 */
-    if (s->pid.integral < grav)
-        s->pid.integral = grav;      /* exec 后锁底=重力 (托力基底, 爬升够力) */
+    //修改：去掉重力补偿
+    // if (s->pid.integral < grav)
+    //     s->pid.integral = grav;      /* exec 后锁底=重力 (托力基底, 爬升够力) */
     out = s->pid.kp * err + s->pid.integral;
+    
     /* 去掉输出托底: 速度环减速 (err 负 → kp·err 负 → out < grav) 不被重力托底
      * 挡住 — 否则到位减速失效 → 来回冲 (速度环与重力前馈打架) */
     s->dir = (s->cmdRpm >= 0) ? 0 : 1;
-    if (out < 0) out = 0;   /* 运动输出 ≥ 0 (方向由 cmdRpm 定, 减速靠 out 减小) */
+    // if(!s->dir) {
+    //     if(thetaRad<=90.0)   
+    //     {
+    //         out=out+grav;  
+    //         // DBG_PRINTF(" \r\n 1111111 out=out+grav\r\n");
+    //     }
+    //     else  
+    //     {
+    //         out=out-grav;
+    //         // DBG_PRINTF(" \r\n 222222 out=out-grav\r\n");
+    //     } 
+    // }
+    // else {
+    //     if(thetaRad<=90.0) 
+    //     {
+    //         // DBG_PRINTF(" \r\n 33333 out=out-grav\r\n");
+    //         out=out-grav;
+    //     } 
+    //     else 
+    //     {
+    //         out=out+grav; 
+    //         // DBG_PRINTF(" \r\n 44444 out=out+grav\r\n");
+    //     }
+        
+    // }
+    if (s->dir == 0) {
+    // 上升：增加出力
+    out = out + s->gravBase;
+    } else {
+        // 下降：减少出力
+        out = out - s->gravBase;
+    }
+    // if (out < 900) out = 900;   /* 运动输出 ≥ 0 (方向由 cmdRpm 定, 减速靠 out 减小) */
 
     s->duty = (uint16_t)CLAMP(out, 0, DUTY_MAX);
+    // s->duty = 900;
 }
 
 /* ================================================================

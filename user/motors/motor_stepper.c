@@ -10,6 +10,11 @@ static volatile unsigned char g_stepBusy = 0;
 static volatile unsigned int g_stepDoneSeq = 0;
 static volatile unsigned int g_stepLastCompletedSteps = 0;
 
+#define STEPPER_APT_COUNTER_HZ 1000000.0f
+#define STEPPER_DEFAULT_SPEED_DPS 20U
+#define STEPPER_MIN_SPEED_DPS 5U
+#define STEPPER_MAX_SPEED_DPS 60U
+
 /* APT0 周期归零中断回调 (每脉冲计一次, 数满自动停 APT) */
 void APT0_StepperCallback(void *param)
 {
@@ -23,6 +28,37 @@ void APT0_StepperCallback(void *param)
             g_stepDoneSeq++;
         }
     }
+}
+
+uint8_t Stepper_SetSpeedDps(Motor_Stepper *m, uint8_t speedDps)
+{
+    unsigned int period;
+    unsigned short compare;
+
+    if (m == NULL || m->apt == NULL || m->degPerStep <= 0.0f)
+        return 0U;
+
+    if (speedDps == 0U)
+        speedDps = STEPPER_DEFAULT_SPEED_DPS;
+    if (speedDps < STEPPER_MIN_SPEED_DPS)
+        speedDps = STEPPER_MIN_SPEED_DPS;
+    if (speedDps > STEPPER_MAX_SPEED_DPS)
+        speedDps = STEPPER_MAX_SPEED_DPS;
+
+    /* UP_DOWN mode: pulse frequency = 1MHz / (2 * period). */
+    period = (unsigned int)(STEPPER_APT_COUNTER_HZ * m->degPerStep /
+                            (2.0f * (float)speedDps) + 0.5f);
+    if (period < 2U)
+        period = 2U;
+    if (period > 65535U)
+        period = 65535U;
+
+    compare = (unsigned short)(period / 2U);
+    (void)HAL_APT_SetTimerPeriod(m->apt, (unsigned short)period,
+                                APT_BUFFER_INDEPENDENT_LOAD,
+                                APT_PERIOD_LOAD_EVENT_ZERO);
+    (void)HAL_APT_SetPWMDuty(m->apt, compare, compare);
+    return speedDps;
 }
 
 void Stepper_Run(Motor_Stepper *m, unsigned int steps, unsigned int dir)

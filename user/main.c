@@ -6,12 +6,12 @@
  *   新目标: Bldc_SetTargetDeg 预置积分 holdIntegral + 放宽积分限幅, 位置环 20ms 后收窄
  *   死区保持: |pe|<2° → 小 P (holdKp) 微速, |cmdRpm|<1 → duty=积分 (保持力)
  * 总线 (UART1, 115200, 多板共线, 跳线 GPIO3_1/GPIO3_0 识别本板):
- *   帧: [AA][ID][CMD][目标/填充][SUM]  SUM=除校验字节外累加 & 0xFF (统一 5B, 无父角)
+ *   帧: [AA][ID][CMD][速度][角度/填充][SUM]，统一6字节
  *   ID=电机号 01~04, 跳线决定本板响应哪些: 00→04(无刷单板) / 01→02+03(双无刷) / 10→01(步进)
- *   读: [AA][ID][01][X][SUM] → 回 [AA][ID][世界角][SUM] (X 忽略)
- *   写: [AA][ID][00][目标][SUM] → 无刷目标角/步进方向0相对角度, 不应答
- *       [AA][01][03][角度][SUM] → 步进方向1相对角度, 不应答
- *   急停: [AA][ID][02][X][SUM] (ID 任意) → 本板所有电机停止, 不应答
+ *   读: [AA][ID][01][0][0][SUM] → 回 [AA][ID][世界角][SUM]
+ *   写: [AA][ID][00][速度][角度][SUM] → 无刷忽略速度，步进方向0相对运动
+ *       [AA][01][03][速度][角度][SUM] → 步进方向1相对运动
+ *   急停: [AA][ID][02][0][0][SUM] (ID任意) → 本板所有电机停止
  *   M3 世界角 = M2 ADC 实测 + M3 局部 − 90 (世界角闭环, 位置环每拍用 M2)
  * 遥测: DIAG_EN=1 时每 200ms 打印本板电机 cur/tgt/duty/cmd/rpm/en
  */
@@ -24,10 +24,12 @@
 #include "clock.h"
 #include "debug.h"
 #include "adc/adc_user.h"
+#include "i2c/i2c_bus.h"
 #include "uart/uart_ring.h"
 #include "uart/uart_bus.h"
 #include "motors/motor_bldc.h"
 #include "motors/motor_stepper.h"
+#include "multicore_master.h"
 
 /* TIMER1与当前CPU均为200MHz；阶段一统一用硬件计数器做微秒级统计。 */
 #define CONTROL_TICKS_PER_US 200U
@@ -49,6 +51,7 @@
 #define STEPPER_TASK_POLL_US 500U
 #define UART_TASK_STACK_SIZE 0x800U
 #define UART_TASK_POLL_US 500U
+#define I2C_DIAG_PRINT_LOOPS 2000U
 
 static unsigned char __attribute__((aligned(16))) g_controlTaskStack[CONTROL_TASK_STACK_SIZE];
 static unsigned char __attribute__((aligned(16))) g_stepperTaskStack[STEPPER_TASK_STACK_SIZE];
@@ -89,14 +92,14 @@ Motor_Bldc g_motor[3] = {
         .pwm = &g_gptHandle0,
         .frGpio = &g_gpio2_2, .frPin = GPIO_PIN_2,
         .bkGpio = &g_gpio4_6, .bkPin = GPIO_PIN_6,
-        .adc = &g_adc3,          /* 电机2 电位器: ADC3 (GPIO16_5) */
+        .adc = &g_adc0,          /* 电机2 电位器: ADC3 (GPIO16_5) */
         .fb = {.timerHz = 200000000UL, .fc = 5.0f, .firstEdge = true},
-        .spd = {.pid = PIDCTRL_INIT(0.5f, 0.2f, 0, 0, DUTY_MAX, -5000, 5000),
-                .gravBase = 5657, .rampRate = 1000, .cmdRate = 800,
-                .holdIntegral = 5000},
-        .pos = {.pid = PIDCTRL_INIT(5.0f, 0, 0, 0, 1000, 0, 1000),
-                .deadband = 2.0f, .holdKp = 30, .maxSpeed = 1000, .decelRate = 1000,
-                .ffUp = 2000, .ffDown = 1000},
+        .spd = {.pid = PIDCTRL_INIT(5.0f, 1.0f, 0, 0, DUTY_MAX, -5000, 5000),
+                .gravBase = 0, .rampRate = 1000, .cmdRate = 1000,   
+                .holdIntegral = 2500},
+        .pos = {.pid = PIDCTRL_INIT(50.0f, 0, 0, 0, 1000, 0, 1000),
+                .deadband = 2.0f, .holdKp = 30, .maxSpeed = 800, .decelRate = 12000,  
+                .ffUp = 0, .ffDown = 0},
     },
     /* 电机3 (肘, 双无刷板) */
     {
@@ -104,14 +107,15 @@ Motor_Bldc g_motor[3] = {
         .pwm = &g_gptHandle1,
         .frGpio = &g_gpio4_7, .frPin = GPIO_PIN_7,
         .bkGpio = &g_gpio6_7, .bkPin = GPIO_PIN_7,
-        .adc = &g_adc2,
+        .adc = &g_adc1,         
         .fb = {.timerHz = 200000000UL, .fc = 5.0f, .firstEdge = true},
-        .spd = {.pid = PIDCTRL_INIT(12.0f, 2.0f, 0, 0, DUTY_MAX, -5000, 5000),
-                .gravBase = 5500, .startupDuty = 5700, .rampRate = 1000, .cmdRate = 800,   /* kp12: 净推力 352→528 (78° 卡住推力小) */
-                .holdIntegral = 1000},
-        .pos = {.pid = PIDCTRL_INIT(5.0f, 0, 0, 0, 1000, 0, 1000),
-                .deadband = 6.0f, .holdKp = 5, .maxSpeed = 300, .decelRate = 500,   /* maxSpeed 300: 位置环速度恢复 (80 太慢爬不动) */
-                .ffUp = 6000, .ffDown = 3000},
+        .spd = {.pid = PIDCTRL_INIT(5.0f, 1.0f, 0, 0, DUTY_MAX, -5000, 5000),
+                .startupDuty = 6500,
+                .gravBase = 1500, .rampRate = 1000, .cmdRate = 1000,   
+                .holdIntegral = 4000},
+        .pos = {.pid = PIDCTRL_INIT(50.0f, 0, 0, 0, 1000, 0, 1000),
+                .deadband = 2.0f, .holdKp = 30, .maxSpeed = 800, .decelRate = 12000,  
+                .ffUp = 0, .ffDown = 0},
     },
     /* 电机4 (04 单关节板 跳线00) — 与电机2 同引脚 (GPT0 PWM / GPIO2_2 FR / GPIO4_6 BK) */
     {
@@ -119,10 +123,10 @@ Motor_Bldc g_motor[3] = {
         .pwm = &g_gptHandle0,
         .frGpio = &g_gpio2_2, .frPin = GPIO_PIN_2,
         .bkGpio = &g_gpio4_6, .bkPin = GPIO_PIN_6,
-        .adc = &g_adc3,          /* 04 板电位器 (板载 ADC0 有问题 → 实际走 ADC3) */
+        .adc = &g_adc0,          /* 04 板电位器 (板载 ADC0 有问题 → 实际走 ADC3) */
         .fb = {.timerHz = 200000000UL, .fc = 5.0f, .firstEdge = true},
         .spd = {.pid = PIDCTRL_INIT(3.0f, 1.0f, 0, 0, DUTY_MAX, -5000, 5000),
-                .gravBase = 500, .rampRate = 300, .cmdRate = 300,   /* M4 末端关节轻负载: gravBase 500 (抖动大→调小), 待实测校准 */
+                .gravBase = 0, .rampRate = 300, .cmdRate = 300,   /* M4 末端关节轻负载: gravBase 500 (抖动大→调小), 待实测校准 */
                 .holdIntegral = 1000},
         .pos = {.pid = PIDCTRL_INIT(30.0f, 0, 0, 0, 1000, 0, 1000),
                 .deadband = 2.0f, .holdKp = 30, .maxSpeed = 300, .decelRate = 1000,   /* maxSpeed 300: 位置环限速 */
@@ -177,15 +181,16 @@ Motor_Stepper g_motor1 = {
     .adc = &g_adc0,             /* 电位器 ADC0 (GPIO3_2) */
     .adc0deg = 3000,
     .adc180deg = 600,
-    .degPerStep = 0.197f,
+    .degPerStep = 0.0985f,
 };
 
 /* ================================================================
- *  总线协议 (多板共线, 跳线 GPIO3_1/GPIO3_0 识别本板)
- *  帧: [AA][ID][CMD][父臂][数据][SUM]  SUM=除校验字节外累加 & 0xFF
- *  读: [AA][ID][01][父臂][SUM] (5字节) → 回 [AA][ID][世界角][SUM]
- *  写: [AA][ID][00][父臂][世界目标][SUM] (6字节) → 执行, 不应答
- *  急停: [AA][ID][02][SUM] (5字节, ID 任意=广播) → 本板所有电机停止, 不应答
+ *  总线协议 (UART/I2C共用，拨码识别本板)
+ *  帧: [AA][ID][CMD][速度][角度/填充][SUM]，统一6字节
+ *  读: [AA][ID][01][0][0][SUM] → 回 [AA][ID][角度][SUM]
+ *  写: [AA][ID][00][速度][角度][SUM] → 执行，不应答
+ *  反向: [AA][01][03][速度][角度][SUM] → 步进方向1相对运动
+ *  急停: [AA][ID][02][0][0][SUM] → 本板所有电机停止，不应答
  *  ID=电机号 01~04, 跳线决定本板响应哪些电机:
  *    跳线 00 → 电机04 (无刷单板) / 跳线 01 → 电机02+03 (双无刷板) / 跳线 10 → 电机01 (步进板)
  *  世界角 = 父臂角 + 局部角 − 顺齐偏移; 双无刷板电机3 的父臂 = 板内实测电机2 角 (ADC3), 帧父臂忽略
@@ -193,8 +198,15 @@ Motor_Stepper g_motor1 = {
 #define FRAME_HEADER 0xAA
 
 static uint8_t g_boardId = 0;       /* 本板跳线地址 */
-static uint8_t g_frame[5];          /* 帧缓冲区 (统一 5 字节, 无父角) */
+static uint8_t g_frame[6];          /* [AA][ID][CMD][速度][角度/填充][SUM] */
 static volatile uint8_t g_frameLen = 0;
+
+typedef enum {
+    PROTOCOL_FROM_UART = 0,
+    PROTOCOL_FROM_I2C = 1
+} ProtocolSource;
+
+static ProtocolSource g_frameSource = PROTOCOL_FROM_UART;
 
 /* 各电机电位器 ADC 读数 (跳线分板, 只对应板有效) */
 static uint16_t adc1 = 0;           /* 电机1 (步进) 电位器读数 */
@@ -235,7 +247,16 @@ static float AngleToDeg(const AngleCal *c, uint16_t val)
     }
     return d[2];
 }
-
+static float Anglecal(uint16_t val)
+{
+    float del_R,cal_r,angle;
+   
+    cal_r=val*10.0/4096.0;
+    del_R=cal_r-2.3;
+    angle=del_R*90.f/3+10.0;
+    // DBG_PRINTF(" \r\n  ANGLE2_cal= %f ,cal_r= %f ,del_r= %f \r\n", angle,cal_r,del_R);
+    return angle;
+}
 /* 世界角 (读应答): g_degS 已按各电机存世界角 —
  * M2/M4 aligned=0 (世界=局部), M3 位置环算好 θ3w=θ2+θ3−90 */
 static float Bus_WorldAngle(uint8_t id, float parentWorld)
@@ -260,10 +281,12 @@ static void Bus_ServoWrite(uint8_t id, uint8_t data)
     Bldc_SetTargetDeg(m, local);
 }
 
-/* 应答 [AA][ID][世界角][SUM]: 临时复用 TX 引脚发送, 发完切回 GPIO */
-static void Bus_Reply(uint8_t id, float deg)
+/* 应答 [AA][ID][世界角][SUM]: 按请求来源走 UART 或 I2C。 */
+static void Bus_Reply(ProtocolSource source, uint8_t id, float deg)
 {
     unsigned char rep[4];
+    BASE_StatusType ret;
+
     if (deg < 0.0f)
         deg = 0.0f;
     rep[0] = FRAME_HEADER;
@@ -272,6 +295,19 @@ static void Bus_Reply(uint8_t id, float deg)
     if (rep[2] > 180)
         rep[2] = 180;
     rep[3] = (unsigned char)(rep[0] + rep[1] + rep[2]); /* SUM */
+
+    if (source == PROTOCOL_FROM_I2C) {
+        /* The bytes are sent when the I2C master starts its read transaction. */
+        ret = I2cBus_PrepareReply(rep, (uint8_t)sizeof(rep));
+#if (DIAG_EN == 1)
+        DBG_PRINTF("i2c reply ready: id=%u angle=%u ret=%d\r\n",
+                   (unsigned int)id, (unsigned int)rep[2], (int)ret);
+#else
+        (void)ret;
+#endif
+        return;
+    }
+
     UartBus_TxMuxToUart();
     HAL_UART_WriteBlocking(&g_uart1, rep, 4, 10000); /* blockingTime 超时 */
     UartBus_TxMuxToGpio();
@@ -457,7 +493,7 @@ static void Motor_RunSpeedLoop(void)
         }
 
         BldcFb_Update(m);
-        thw = g_degS[i] * 0.0174533f;
+        thw = g_degS[i];
         BldcSpd_Run(m, 0.005f, thw);
         Bldc_SetOutput(m, m->spd.duty, (uint8_t)(1U - m->spd.dir));
     }
@@ -506,32 +542,34 @@ static void Motor_RunPositionLoop(void)
 
     /* M2: ADC3实测，局部角等于世界角。 */
     if (Bus_IsMyMotor(0x02)) {
-        m = &g_motor[0];
-        ADC_Read(&g_adc3, &v);
-        g_adcRaw[0] = v;
-        deg = AngleToDeg(&g_cal[0], v);
-        g_degS[0] = g_degS[0] * 0.9f + deg * 0.1f;
-        PosLoopOne(m, 0);
+         m = &g_motor[0];
+                ADC_Read(&g_adc0, &v);
+                g_adcRaw[0] = v;
+                deg = Anglecal(v);
+                g_degS[0] = g_degS[0] * 0.9f + deg * 0.1f;   /* EMA 0.9/0.1 */
+                PosLoopOne(m, 0);
     }
 
     /* M3: 世界角 = M2世界角 + M3局部角 - 90度。 */
     if (Bus_IsMyMotor(0x03)) {
         m = &g_motor[1];
-        ADC_Read(&g_adc2, &v);
-        g_adcRaw[1] = v;
-        deg = AngleToDeg(&g_cal[1], v);
-        g_degS[1] = g_degS[1] * 0.9f + (g_degS[0] + deg - g_aligned[1]) * 0.1f;
-        PosLoopOne(m, 1);
+                ADC_Read(&g_adc1, &v);
+                g_adcRaw[1] = v;
+                deg = Anglecal(v);
+                // g_degS[1] = g_degS[1] * 0.9f + deg * 0.1f;   /* EMA 0.9/0.1 */
+                g_degS[1]=deg;
+                PosLoopOne(m, 1);
     }
 
     /* M4: 当前单关节板使用ADC3，父臂角仍按既有固定值处理。 */
     if (Bus_IsMyMotor(0x04)) {
         m = &g_motor[2];
-        ADC_Read(&g_adc3, &v);
-        g_adcRaw[2] = v;
-        deg = AngleToDeg(&g_cal[2], v);
-        g_degS[2] = g_degS[2] * 0.7f + (M4_M3_WORLD_DEG + deg - 90.0f) * 0.3f;
-        PosLoopOne(m, 2);
+                ADC_Read(&g_adc0, &v);
+                g_adcRaw[2] = v;
+                deg = Anglecal(v);
+                // g_degS[2] = g_degS[2] * 0.7f + (M4_M3_WORLD_DEG + deg - 90.0f) * 0.3f;
+                g_degS[2]=deg;
+                PosLoopOne(m, 2);
     }
 }
 
@@ -563,6 +601,7 @@ typedef struct {
     MotorCommandType type;
     uint8_t motorId;
     uint8_t direction;
+    uint8_t speedDps;
     uint16_t angle;
 } MotorCommand;
 
@@ -608,13 +647,14 @@ static void MotorCommand_Clear(void)
     g_stepperCommandReadSeq = g_stepperCommandWriteSeq;
 }
 
-static void StepperCommand_Update(uint8_t angle, uint8_t direction)
+static void StepperCommand_Update(uint8_t angle, uint8_t direction, uint8_t speedDps)
 {
     MotorCommand cmd;
 
     cmd.type = MOTOR_CMD_MOVE;
     cmd.motorId = 0x01U;
     cmd.direction = direction;
+    cmd.speedDps = speedDps;
     cmd.angle = angle;
     MotorCommand_Update(&cmd);
 }
@@ -622,10 +662,35 @@ static void StepperCommand_Update(uint8_t angle, uint8_t direction)
 
 static void UartPump(void)
 {
-    while (UART_Ring_HasData()) {
-        uint8_t b = UART_Ring_ReadByte();
-        if (g_frameLen == 0 && b != FRAME_HEADER)
-            continue;                 /* 非帧首字节丢弃, 等包头 0xAA 同步 */
+    uint8_t drainI2cFirst;
+
+    I2cBus_Service();
+    /* Once an I2C transaction is selected, drain all six bytes atomically. */
+    drainI2cFirst = I2cBus_HasData();
+    while (UART_Ring_HasData() || I2cBus_HasData()) {
+        uint8_t b;
+        ProtocolSource byteSource;
+
+        if (drainI2cFirst != 0U && I2cBus_HasData()) {
+            b = I2cBus_ReadByte();
+            byteSource = PROTOCOL_FROM_I2C;
+        } else if (UART_Ring_HasData()) {
+            b = UART_Ring_ReadByte();
+            byteSource = PROTOCOL_FROM_UART;
+        } else {
+            b = I2cBus_ReadByte();
+            byteSource = PROTOCOL_FROM_I2C;
+            drainI2cFirst = 1U;
+        }
+
+        /* Never combine bytes from UART and I2C into one protocol frame. */
+        if (g_frameLen != 0U && byteSource != g_frameSource)
+            g_frameLen = 0U;
+        if (g_frameLen == 0U) {
+            if (b != FRAME_HEADER)
+                continue;
+            g_frameSource = byteSource;
+        }
         if (g_frameLen < sizeof(g_frame))
             g_frame[g_frameLen++] = b;
         if (g_frameLen >= 2 && g_frame[1] > 4) {
@@ -640,13 +705,13 @@ static void UartPump(void)
             g_frameLen = 0;           /* CMD 非法, 重新同步 */
             continue;
         }
-        /* 帧长: 统一 5 字节 [AA][ID][CMD][目标/填充][SUM] — 无父角
-         * (父臂/顺齐偏移全走 ADC 实测/世界角闭环, 帧第4字节: 写=世界目标, 读/急停=忽略) */
-        uint8_t needLen = 5;
+        /* 统一6字节: [AA][ID][CMD][速度][角度/填充][SUM]。 */
+        uint8_t needLen = 6;
         if (g_frameLen < needLen)
             continue;
-        uint8_t id   = g_frame[1];
-        uint8_t data = g_frame[3];
+        uint8_t id    = g_frame[1];
+        uint8_t speed = g_frame[3];
+        uint8_t data  = g_frame[4];
         uint8_t sum  = g_frame[needLen - 1];
         g_frameLen = 0;
 
@@ -676,6 +741,15 @@ static void UartPump(void)
                     Bldc_Stop(&g_motor[i]);
             }
 #ifdef NOS_TASK_SUPPORT
+            /* Dual-BLDC board: shadow-forward STOP to both slave cores. */
+            if (g_boardId == 1U) {
+                if (MultiCoreMaster_SendMotorCommand(0x02U, cmd, data) != BASE_STATUS_OK)
+                    DBG_PRINTF("mc route failed: id=2 cmd=%u\r\n", (unsigned int)cmd);
+                if (MultiCoreMaster_SendMotorCommand(0x03U, cmd, data) != BASE_STATUS_OK)
+                    DBG_PRINTF("mc route failed: id=3 cmd=%u\r\n", (unsigned int)cmd);
+            }
+#endif
+#ifdef NOS_TASK_SUPPORT
             if (Bus_IsMyMotor(0x01U))
                 g_stepperStopRequest = 1U;
 #else
@@ -696,17 +770,31 @@ static void UartPump(void)
 #if (DIAG_EN == 1)
                 DBG_PRINTF("rx: m%u read\r\n", (unsigned int)id);
 #endif
+#ifdef NOS_TASK_SUPPORT
+                if (g_boardId == 1U &&
+                    MultiCoreMaster_SendMotorCommand(id, cmd, data) != BASE_STATUS_OK)
+                    DBG_PRINTF("mc route failed: id=%u cmd=%u\r\n",
+                               (unsigned int)id, (unsigned int)cmd);
+#endif
                 if (id == 0x01)
-                    Bus_Reply(id, Motor1_Angle()); /* 步进: 局部角 */
+                    Bus_Reply(g_frameSource, id, Motor1_Angle()); /* 步进: 局部角 */
                 else
-                    Bus_Reply(id, Bus_WorldAngle(id, 0.0f)); /* 世界角 (缓存) */
+                    Bus_Reply(g_frameSource, id, Bus_WorldAngle(id, 0.0f)); /* 世界角 (缓存) */
                 break;
             case 0: /* 无刷目标角；步进电机方向0相对转动data度 */
+#ifdef NOS_TASK_SUPPORT
+                /* Shadow route only: CPU0 still owns and drives both BLDC motors. */
+                if (g_boardId == 1U &&
+                    MultiCoreMaster_SendMotorCommand(id, cmd, data) != BASE_STATUS_OK)
+                    DBG_PRINTF("mc route failed: id=%u cmd=%u\r\n",
+                               (unsigned int)id, (unsigned int)cmd);
+#endif
                 if (id == 0x01) {
                     /* 电机1 (步进板 跳线10) */
 #ifdef NOS_TASK_SUPPORT
-                    StepperCommand_Update(data, 0U);
+                    StepperCommand_Update(data, 0U, speed);
 #else
+                    (void)Stepper_SetSpeedDps(&g_motor1, speed);
                     Stepper_RunRelativeAngle(data, 0U);
 #endif
                 } else if (id == 0x02) {
@@ -723,8 +811,9 @@ static void UartPump(void)
             case 3: /* 步进电机方向1相对转动data度 */
                 if (id == 0x01) {
 #ifdef NOS_TASK_SUPPORT
-                    StepperCommand_Update(data, 1U);
+                    StepperCommand_Update(data, 1U, speed);
 #else
+                    (void)Stepper_SetSpeedDps(&g_motor1, speed);
                     Stepper_RunRelativeAngle(data, 1U);
 #endif
                 }
@@ -733,6 +822,7 @@ static void UartPump(void)
                 break;
         }
     }
+    I2cBus_Service();
 }
 
 #ifdef NOS_TASK_SUPPORT
@@ -770,10 +860,12 @@ static void StepperTask(void *param)
         /* Finish the active move, then consume only the newest pending command. */
         if (Stepper_IsBusy() == 0U && MotorCommand_TakeLatest(&cmd) == 0) {
             if (cmd.type == MOTOR_CMD_MOVE && cmd.motorId == 0x01U) {
+                uint8_t actualSpeed = Stepper_SetSpeedDps(&g_motor1, cmd.speedDps);
 #if (DIAG_EN == 1)
-                DBG_PRINTF("step start: angle=%u dir=%u\r\n",
+                DBG_PRINTF("step start: angle=%u dir=%u speed=%u dps\r\n",
                            (unsigned int)cmd.angle,
-                           (unsigned int)cmd.direction);
+                           (unsigned int)cmd.direction,
+                           (unsigned int)actualSpeed);
 #endif
                 Stepper_RunRelativeAngle((uint8_t)cmd.angle, cmd.direction);
             }
@@ -785,10 +877,61 @@ static void StepperTask(void *param)
 
 static void UartTask(void *param)
 {
+#if (DIAG_EN == 1)
+    uint32_t i2cDiagLoops = 0U;
+#endif
+
     (void)param;
 
     while (1) {
         UartPump();
+#if (DIAG_EN == 1)
+
+//         i2cDiagLoops++;
+
+//         if (i2cDiagLoops >= I2C_DIAG_PRINT_LOOPS) {
+//             I2cBusDiag diag;
+
+//             i2cDiagLoops = 0U;
+
+//             I2cBus_GetDiag(&diag);
+
+//             DBG_PRINTF(
+//                 "i2c diag active=%u scl=%u sda=%u reinit=%u state=%u "
+//                 "start=%u match=%u "
+//                 "ackErr=%u sclTo=%u stop=%u short=%u "
+//                 "rx=%u tx=%u err=%u\r\n",
+//                 (unsigned int)diag.busActive,
+//                 (unsigned int)diag.sclLevel,
+//                 (unsigned int)diag.sdaLevel,
+//                 (unsigned int)diag.reinitCount,
+//                 (unsigned int)diag.driverState,
+//                 (unsigned int)diag.startCount,
+//                 (unsigned int)diag.addressMatchCount,
+//                 (unsigned int)diag.ackUnmatchCount,
+//                 (unsigned int)diag.sclTimeoutCount,
+//                 (unsigned int)diag.stopCount,
+//                 (unsigned int)diag.shortStopCount,
+//                 (unsigned int)diag.rxCount,
+//                 (unsigned int)diag.txCount,
+//                 (unsigned int)diag.errorCount
+//             );
+
+//             DBG_PRINTF(
+//                 "i2c last raw=0x%08X addr=0x%02X rw=%u "
+//                 "own=0x%08X intr=0x%08X "
+//                 "sclTout=0x%08X fsm=0x%08X\r\n",
+//                 (unsigned int)diag.lastRawStatus,
+//                 (unsigned int)diag.lastRxAddress,
+//                 (unsigned int)diag.lastRxDirection,
+//                 (unsigned int)diag.ownAddressRegister,
+//                 (unsigned int)diag.interruptEnableRegister,
+//                 (unsigned int)diag.sclTimeoutRegister,
+//                 (unsigned int)diag.fsmStatusRegister
+//             );
+//         }
+
+#endif
         (void)NOS_TaskDelay(UART_TASK_POLL_US);
     }
 }
@@ -809,7 +952,7 @@ static int StepperTask_Create(void)
     return NOS_TaskCreate(&param, &taskId);
 }
 
-static int UartTask_Create(void)
+static int UartTask_Create(unsigned int priority)
 {
     unsigned int taskId;
     NOS_TaskInitParam param = {0};
@@ -817,7 +960,7 @@ static int UartTask_Create(void)
     param.name = "uartTask";
     param.taskEntry = UartTask;
     param.param = 0;
-    param.priority = 3U;
+    param.priority = priority;
     param.stackAddr = (unsigned int)g_uartTaskStack;
     param.stackSize = sizeof(g_uartTaskStack);
     param.privateData = 0U;
@@ -955,9 +1098,14 @@ static int ControlTask_Create(void)
 int main(void)
 {
     int i;
+    BASE_StatusType i2cRet;
 #ifdef NOS_TASK_SUPPORT
-    int controlTaskRet;
-    int stepperTaskRet = -1;
+    int multicoreRet = -1;
+    uint8_t multicoreEnabled = 0U;
+#endif
+#ifdef NOS_TASK_SUPPORT
+    int controlTaskRet = 0;
+    int stepperTaskRet = 0;
     int uartTaskRet = -1;
 #endif
     SystemInit();
@@ -975,6 +1123,30 @@ int main(void)
     // g_boardId = 0x02;
     DBG_PRINTF("board id=%u\r\n", (unsigned int)g_boardId);
 
+    /*
+     * I2C0 control bus: PIN72=SCL, PIN71=SDA, temporary internal pull-ups.
+     * Keep UART1 enabled during migration; both inputs reuse the same 6-byte parser.
+     */
+    i2cRet = I2cBus_Init(g_boardId);
+    DBG_PRINTF("i2c0 slave addr=0x%02X init ret=%d\r\n",
+               (unsigned int)I2cBus_GetSlaveAddress(), (int)i2cRet);
+
+#ifdef NOS_TASK_SUPPORT
+    if (g_boardId == 2U) {
+        /* Stepper controller: CPU0 only; CPU1/CPU2 remain stopped. */
+        DBG_PRINTF("single-core stepper mode\r\n");
+    } else if (g_boardId == 1U) {
+        /* Three-BLDC controller: CPU0 starts CPU1/CPU2 and IPCM. */
+        multicoreRet = MultiCoreMaster_InitAndStart();
+        if (multicoreRet == 0)
+            multicoreEnabled = 1U;
+        DBG_PRINTF("multicore start ret=%d\r\n", multicoreRet);
+    } else {
+        /* Legacy address 0 and invalid address 3 stay in safe single-core mode. */
+        DBG_PRINTF("single-core legacy/invalid mode\r\n");
+    }
+#endif
+
     /* 上电解锁: 本驱动 IC 上电 BK 低会进保护锁存, FR 翻转一次清掉, 否则开环起步转不动 */
     for (i = 0; i < 3; i++) {
         if (!Bus_IsMyMotor((uint8_t)(i + 2)))
@@ -984,18 +1156,22 @@ int main(void)
     DBG_PRINTF("ready\r\n");
 
 #ifdef NOS_TASK_SUPPORT
-    controlTaskRet = ControlTask_Create();
-    DBG_PRINTF("control task create ret=%d\r\n", controlTaskRet);
+    if (g_boardId == 2U) {
+        /* Stepper board: UART must stay responsive while APT generates pulses. */
+        DBG_PRINTF("control task skipped (stepper board)\r\n");
+        uartTaskRet = UartTask_Create(1U);
+        DBG_PRINTF("uart task create ret=%d\r\n", uartTaskRet);
 
-    if (controlTaskRet == 0) {
-        /* Only the board owning motor ID 01 needs a stepper task. */
-        stepperTaskRet = 0;
-        if (Bus_IsMyMotor(0x01U))
+        if (uartTaskRet == 0)
             stepperTaskRet = StepperTask_Create();
         DBG_PRINTF("stepper task create ret=%d\r\n", stepperTaskRet);
+    } else {
+        /* BLDC/legacy board: precise control loop remains the highest-priority task. */
+        controlTaskRet = ControlTask_Create();
+        DBG_PRINTF("control task create ret=%d\r\n", controlTaskRet);
 
-        if (stepperTaskRet == 0)
-            uartTaskRet = UartTask_Create();
+        if (controlTaskRet == 0)
+            uartTaskRet = UartTask_Create(2U);
         DBG_PRINTF("uart task create ret=%d\r\n", uartTaskRet);
     }
 
@@ -1011,6 +1187,10 @@ int main(void)
 #endif
 
     while (1) {
+#ifdef NOS_TASK_SUPPORT
+        if (multicoreEnabled != 0U)
+            MultiCoreMaster_Service();
+#endif
         /* 串口: 总线帧 (0xAA 包头) */
 #ifndef NOS_TASK_SUPPORT
         UartPump();
